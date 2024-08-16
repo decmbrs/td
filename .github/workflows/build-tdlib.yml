@@ -1,0 +1,94 @@
+name: Build TDLib for Android
+
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+    branches:
+      - master
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v2
+
+    - name: Remove existing td directory
+      run: |
+        if [ -d "td" ]; then
+          rm -rf td
+        fi
+
+    - name: Clone TDLib repository
+      run: git clone --depth=1 https://github.com/tdlib/td.git td
+
+    - name: Verify td/example directory exists
+      run: |
+        if [ ! -d "td/example/android" ]; then
+          echo "Directory td/example/android does not exist."
+          ls -la td
+          exit 1
+        fi
+
+    - name: Set up JDK 17
+      uses: actions/setup-java@v2
+      with:
+        distribution: 'adopt'
+        java-version: '17'
+
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y gperf make perl php sed tar unzip
+
+    - name: Run environment check
+      run: |
+        cd td/example/android
+        ./check-environment.sh
+
+    - name: Fetch Android SDK
+      run: |
+        cd td/example/android
+        ./fetch-sdk.sh
+
+    - name: Build OpenSSL
+      run: |
+        cd td/example/android
+        ./build-openssl.sh
+
+    - name: Build TDLib
+      run: |
+        cd td/example/android
+        ./build-tdlib.sh
+
+    - name: Upload TDLib artifacts
+      uses: actions/upload-artifact@v2
+      with:
+        name: tdlib-libs
+        path: td/example/android/tdlib/libs
+
+    - name: Upload Java interface
+      if: ${{ success() && always() }}
+      uses: actions/upload-artifact@v2
+      with:
+        name: tdlib-java
+        path: td/example/android/tdlib/java
+
+    - name: Upload Javadoc
+      if: ${{ success() && always() }}
+      uses: actions/upload-artifact@v2
+      with:
+        name: tdlib-javadoc
+        path: td/example/android/tdlib/javadoc
+
+    - name: Upload TDLib zip
+      if: ${{ success() && always() }}
+      uses: actions/upload-artifact@v2
+      with:
+        name: tdlib-zip
+        path: |
+          td/example/android/tdlib/tdlib.zip
+          td/example/android/tdlib/tdlib-debug.zip
