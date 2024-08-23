@@ -320,6 +320,7 @@ set(TD_MTPROTO_SOURCE
 
 set(TDLIB_SOURCE_PART1
   td/telegram/AccountManager.cpp
+  td/telegram/AlarmManager.cpp
   td/telegram/AnimationsManager.cpp
   td/telegram/Application.cpp
   td/telegram/AttachMenuManager.cpp
@@ -337,6 +338,7 @@ set(TDLIB_SOURCE_PART1
   td/telegram/BotCommandScope.cpp
   td/telegram/BotInfoManager.cpp
   td/telegram/BotMenuButton.cpp
+  td/telegram/BotQueries.cpp
   td/telegram/BusinessAwayMessage.cpp
   td/telegram/BusinessAwayMessageSchedule.cpp
   td/telegram/BusinessBotManageBar.cpp
@@ -536,6 +538,7 @@ set(TDLIB_SOURCE_PART2
   td/telegram/ReplyMarkup.cpp
   td/telegram/ReportReason.cpp
   td/telegram/RequestedDialogType.cpp
+  td/telegram/Requests.cpp
   td/telegram/RestrictionReason.cpp
   td/telegram/SavedMessagesManager.cpp
   td/telegram/SavedMessagesTopicId.cpp
@@ -606,6 +609,7 @@ set(TDLIB_SOURCE_PART2
   td/telegram/AccessRights.h
   td/telegram/AccountManager.h
   td/telegram/AffectedHistory.h
+  td/telegram/AlarmManager.h
   td/telegram/AnimationsManager.h
   td/telegram/Application.h
   td/telegram/AttachMenuManager.h
@@ -625,6 +629,7 @@ set(TDLIB_SOURCE_PART2
   td/telegram/BotCommandScope.h
   td/telegram/BotInfoManager.h
   td/telegram/BotMenuButton.h
+  td/telegram/BotQueries.h
   td/telegram/BusinessAwayMessage.h
   td/telegram/BusinessAwayMessageSchedule.h
   td/telegram/BusinessBotManageBar.h
@@ -877,6 +882,7 @@ set(TDLIB_SOURCE_PART2
   td/telegram/ReportReason.h
   td/telegram/RequestActor.h
   td/telegram/RequestedDialogType.h
+  td/telegram/Requests.h
   td/telegram/RestrictionReason.h
   td/telegram/SavedMessagesManager.h
   td/telegram/SavedMessagesTopicId.h

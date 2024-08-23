@@ -44,7 +44,6 @@
 #include "td/telegram/MessageTtl.h"
 #include "td/telegram/misc.h"
 #include "td/telegram/net/DcOptions.h"
-#include "td/telegram/net/NetQuery.h"
 #include "td/telegram/NotificationManager.h"
 #include "td/telegram/NotificationSettingsManager.h"
 #include "td/telegram/NotificationSettingsScope.h"
@@ -108,23 +107,6 @@
 namespace td {
 
 int VERBOSITY_NAME(get_difference) = VERBOSITY_NAME(INFO);
-
-class OnUpdate {
-  UpdatesManager *updates_manager_;
-  tl_object_ptr<telegram_api::Update> &update_;
-  mutable Promise<Unit> promise_;
-
- public:
-  OnUpdate(UpdatesManager *updates_manager, tl_object_ptr<telegram_api::Update> &update, Promise<Unit> &&promise)
-      : updates_manager_(updates_manager), update_(update), promise_(std::move(promise)) {
-  }
-
-  template <class T>
-  void operator()(T &obj) const {
-    CHECK(&*update_ == &obj);
-    updates_manager_->on_update(move_tl_object_as<T>(update_), std::move(promise_));
-  }
-};
 
 class GetUpdatesStateQuery final : public Td::ResultHandler {
   Promise<tl_object_ptr<telegram_api::updates_state>> promise_;
@@ -2275,12 +2257,11 @@ void UpdatesManager::try_reload_data() {
   td_->quick_reply_manager_->reload_quick_reply_shortcuts();
   td_->reaction_manager_->reload_reactions();
   td_->reaction_manager_->reload_message_effects();
-
   for (int32 type = 0; type < MAX_REACTION_LIST_TYPE; type++) {
     auto reaction_list_type = static_cast<ReactionListType>(type);
     td_->reaction_manager_->reload_reaction_list(reaction_list_type, "try_reload_data");
   }
-
+  td_->star_manager_->reload_owned_star_count();
   for (int32 type = 0; type < MAX_STICKER_TYPE; type++) {
     auto sticker_type = static_cast<StickerType>(type);
     td_->stickers_manager_->get_installed_sticker_sets(sticker_type, Auto());
