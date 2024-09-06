@@ -151,7 +151,6 @@
 #include "td/telegram/SynchronousRequests.h"
 #include "td/telegram/td_api.hpp"
 #include "td/telegram/TdDb.h"
-#include "td/telegram/telegram_api.h"
 #include "td/telegram/TermsOfServiceManager.h"
 #include "td/telegram/TimeZoneManager.h"
 #include "td/telegram/TopDialogCategory.h"
@@ -1564,31 +1563,6 @@ class ChangeStickerSetRequest final : public RequestOnceActor {
       , is_installed_(is_installed)
       , is_archived_(is_archived) {
     set_tries(4);
-  }
-};
-
-class UploadStickerFileRequest final : public RequestOnceActor {
-  UserId user_id_;
-  StickerFormat sticker_format_;
-  td_api::object_ptr<td_api::InputFile> input_file_;
-
-  FileId file_id;
-
-  void do_run(Promise<Unit> &&promise) final {
-    file_id = td_->stickers_manager_->upload_sticker_file(user_id_, sticker_format_, input_file_, std::move(promise));
-  }
-
-  void do_send_result() final {
-    send_result(td_->file_manager_->get_file_object(file_id));
-  }
-
- public:
-  UploadStickerFileRequest(ActorShared<Td> td, uint64 request_id, int64 user_id, StickerFormat sticker_format,
-                           td_api::object_ptr<td_api::InputFile> input_file)
-      : RequestOnceActor(std::move(td), request_id)
-      , user_id_(user_id)
-      , sticker_format_(sticker_format)
-      , input_file_(std::move(input_file)) {
   }
 };
 
@@ -3434,11 +3408,19 @@ void Requests::on_request(uint64 id, const td_api::addMessageReaction &request) 
                                                request.update_recent_reactions_, std::move(promise));
 }
 
-void Requests::on_request(uint64 id, const td_api::addPaidMessageReaction &request) {
+void Requests::on_request(uint64 id, const td_api::addPendingPaidMessageReaction &request) {
   CHECK_IS_USER();
   CREATE_OK_REQUEST_PROMISE();
   td_->messages_manager_->add_paid_message_reaction({DialogId(request.chat_id_), MessageId(request.message_id_)},
-                                                    request.star_count_, request.is_anonymous_, std::move(promise));
+                                                    request.star_count_, request.use_default_is_anonymous_,
+                                                    request.is_anonymous_, std::move(promise));
+}
+
+void Requests::on_request(uint64 id, const td_api::commitPendingPaidMessageReactions &request) {
+  CHECK_IS_USER();
+  CREATE_OK_REQUEST_PROMISE();
+  td_->messages_manager_->commit_paid_message_reactions({DialogId(request.chat_id_), MessageId(request.message_id_)},
+                                                        std::move(promise));
 }
 
 void Requests::on_request(uint64 id, const td_api::removePendingPaidMessageReactions &request) {
@@ -6336,6 +6318,11 @@ void Requests::on_request(uint64 id, const td_api::getStickerSet &request) {
   CREATE_REQUEST(GetStickerSetRequest, request.set_id_);
 }
 
+void Requests::on_request(uint64 id, const td_api::getStickerSetName &request) {
+  CREATE_TEXT_REQUEST_PROMISE();
+  td_->stickers_manager_->get_sticker_set_name(StickerSetId(request.set_id_), std::move(promise));
+}
+
 void Requests::on_request(uint64 id, td_api::searchStickerSet &request) {
   CLEAN_INPUT_STRING(request.name_);
   CREATE_REQUEST(SearchStickerSetRequest, std::move(request.name_));
@@ -6373,8 +6360,9 @@ void Requests::on_request(uint64 id, td_api::reorderInstalledStickerSets &reques
 }
 
 void Requests::on_request(uint64 id, td_api::uploadStickerFile &request) {
-  CREATE_REQUEST(UploadStickerFileRequest, request.user_id_, get_sticker_format(request.sticker_format_),
-                 std::move(request.sticker_));
+  CREATE_REQUEST_PROMISE();
+  td_->stickers_manager_->upload_sticker_file(UserId(request.user_id_), get_sticker_format(request.sticker_format_),
+                                              std::move(request.sticker_), std::move(promise));
 }
 
 void Requests::on_request(uint64 id, td_api::getSuggestedStickerSetName &request) {
@@ -6985,7 +6973,7 @@ void Requests::on_request(uint64 id, td_api::answerInlineQuery &request) {
                                                     request.cache_time_, request.next_offset_, std::move(promise));
 }
 
-void Requests::on_request(uint64 id, td_api::getPopularWebAppBots &request) {
+void Requests::on_request(uint64 id, td_api::getGrossingWebAppBots &request) {
   CHECK_IS_USER();
   CLEAN_INPUT_STRING(request.offset_);
   CREATE_REQUEST_PROMISE();
@@ -7466,13 +7454,14 @@ void Requests::on_request(uint64 id, td_api::applyPremiumGiftCode &request) {
   apply_premium_gift_code(td_, request.code_, std::move(promise));
 }
 
-void Requests::on_request(uint64 id, td_api::launchPrepaidPremiumGiveaway &request) {
+void Requests::on_request(uint64 id, td_api::launchPrepaidGiveaway &request) {
   CHECK_IS_USER();
   CREATE_OK_REQUEST_PROMISE();
-  launch_prepaid_premium_giveaway(td_, request.giveaway_id_, std::move(request.parameters_), std::move(promise));
+  launch_prepaid_premium_giveaway(td_, request.giveaway_id_, std::move(request.parameters_), request.winner_count_,
+                                  request.star_count_, std::move(promise));
 }
 
-void Requests::on_request(uint64 id, const td_api::getPremiumGiveawayInfo &request) {
+void Requests::on_request(uint64 id, const td_api::getGiveawayInfo &request) {
   CHECK_IS_USER();
   CREATE_REQUEST_PROMISE();
   get_premium_giveaway_info(td_, {DialogId(request.chat_id_), MessageId(request.message_id_)}, std::move(promise));
@@ -7488,6 +7477,12 @@ void Requests::on_request(uint64 id, const td_api::getStarGiftPaymentOptions &re
   CHECK_IS_USER();
   CREATE_REQUEST_PROMISE();
   td_->star_manager_->get_star_gift_payment_options(UserId(request.user_id_), std::move(promise));
+}
+
+void Requests::on_request(uint64 id, const td_api::getStarGiveawayPaymentOptions &request) {
+  CHECK_IS_USER();
+  CREATE_REQUEST_PROMISE();
+  td_->star_manager_->get_star_giveaway_payment_options(std::move(promise));
 }
 
 void Requests::on_request(uint64 id, td_api::getStarTransactions &request) {
