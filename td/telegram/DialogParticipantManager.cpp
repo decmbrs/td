@@ -1,5 +1,5 @@
 //
-// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2024
+// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2025
 //
 // Distributed under the Boost Software License, Version 1.0. (See accompanying
 // file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
@@ -1087,6 +1087,53 @@ Status DialogParticipantManager::can_manage_dialog_join_requests(DialogId dialog
   return Status::OK();
 }
 
+void DialogParticipantManager::fix_pending_join_requests(DialogId dialog_id, int32 &pending_join_request_count,
+                                                         vector<UserId> &pending_join_request_user_ids) const {
+  bool need_drop_pending_join_requests = [&] {
+    if (pending_join_request_count < 0) {
+      return true;
+    }
+    switch (dialog_id.get_type()) {
+      case DialogType::User:
+      case DialogType::SecretChat:
+        return true;
+      case DialogType::Chat: {
+        auto chat_id = dialog_id.get_chat_id();
+        auto status = td_->chat_manager_->get_chat_status(chat_id);
+        if (!status.can_manage_invite_links()) {
+          return true;
+        }
+        break;
+      }
+      case DialogType::Channel: {
+        auto channel_id = dialog_id.get_channel_id();
+        auto status = td_->chat_manager_->get_channel_permissions(channel_id);
+        if (!status.can_manage_invite_links()) {
+          return true;
+        }
+        break;
+      }
+      case DialogType::None:
+      default:
+        UNREACHABLE();
+    }
+    return false;
+  }();
+  if (need_drop_pending_join_requests) {
+    pending_join_request_count = 0;
+    pending_join_request_user_ids.clear();
+  } else if (static_cast<size_t>(pending_join_request_count) < pending_join_request_user_ids.size()) {
+    LOG(ERROR) << "Fix pending join request count from " << pending_join_request_count << " to "
+               << pending_join_request_user_ids.size();
+    pending_join_request_count = narrow_cast<int32>(pending_join_request_user_ids.size());
+  }
+
+  static constexpr size_t MAX_PENDING_JOIN_REQUESTS = 3;
+  if (pending_join_request_user_ids.size() > MAX_PENDING_JOIN_REQUESTS) {
+    pending_join_request_user_ids.resize(MAX_PENDING_JOIN_REQUESTS);
+  }
+}
+
 void DialogParticipantManager::get_dialog_join_requests(
     DialogId dialog_id, const string &invite_link, const string &query,
     td_api::object_ptr<td_api::chatJoinRequest> offset_request, int32 limit,
@@ -1481,6 +1528,10 @@ void DialogParticipantManager::on_update_channel_participant(
     LOG(ERROR) << "Fix wrong can_be_edited in " << new_dialog_participant << " from " << channel_id << " changed from "
                << old_dialog_participant;
     new_dialog_participant.status_.toggle_can_be_edited();
+  }
+  if (old_dialog_participant.status_.is_banned() && DialogId(user_id) == old_dialog_participant.dialog_id_) {
+    LOG(ERROR) << "User changed self status in " << channel_id << " from " << old_dialog_participant << " to "
+               << new_dialog_participant;
   }
 
   if (old_dialog_participant.dialog_id_ == td_->dialog_manager_->get_my_dialog_id() &&
@@ -2297,6 +2348,7 @@ void DialogParticipantManager::delete_chat_participant(ChatId chat_id, UserId us
 void DialogParticipantManager::add_channel_participant(
     ChannelId channel_id, UserId user_id, const DialogParticipantStatus &old_status,
     Promise<td_api::object_ptr<td_api::failedToAddMembers>> &&promise) {
+  TRY_STATUS_PROMISE(promise, G()->close_status());
   if (td_->auth_manager_->is_bot()) {
     return promise.set_error(Status::Error(400, "Bots can't add new chat members"));
   }
@@ -2633,11 +2685,7 @@ void DialogParticipantManager::restrict_channel_participant(ChannelId channel_id
       create_actor<SleepActor>(
           "RestrictChannelParticipantSleepActor", 1.0,
           PromiseCreator::lambda([actor_id, channel_id, participant_dialog_id, new_status = std::move(new_status),
-                                  promise = std::move(promise)](Result<> result) mutable {
-            if (result.is_error()) {
-              return promise.set_error(result.move_as_error());
-            }
-
+                                  promise = std::move(promise)](Unit) mutable {
             send_closure(actor_id, &DialogParticipantManager::restrict_channel_participant, channel_id,
                          participant_dialog_id, std::move(new_status), DialogParticipantStatus::Banned(0),
                          std::move(promise));
@@ -2664,11 +2712,7 @@ void DialogParticipantManager::restrict_channel_participant(ChannelId channel_id
           create_actor<SleepActor>(
               "AddChannelParticipantSleepActor", 1.0,
               PromiseCreator::lambda([actor_id, channel_id, participant_dialog_id, old_status = std::move(old_status),
-                                      promise = std::move(promise)](Result<Unit> result) mutable {
-                if (result.is_error()) {
-                  return promise.set_error(result.move_as_error());
-                }
-
+                                      promise = std::move(promise)](Unit) mutable {
                 send_closure(actor_id, &DialogParticipantManager::add_channel_participant, channel_id,
                              participant_dialog_id.get_user_id(), old_status,
                              wrap_failed_to_add_members_promise(std::move(promise)));

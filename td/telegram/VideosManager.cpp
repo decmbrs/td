@@ -1,5 +1,5 @@
 //
-// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2024
+// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2025
 //
 // Distributed under the Boost Software License, Version 1.0. (See accompanying
 // file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
@@ -100,15 +100,19 @@ FileId VideosManager::on_get_video(unique_ptr<Video> new_video, bool replace) {
     v = std::move(new_video);
   } else if (replace) {
     CHECK(v->file_id == new_video->file_id);
-    if (v->mime_type != new_video->mime_type) {
-      LOG(DEBUG) << "Video " << file_id << " MIME type has changed";
-      v->mime_type = std::move(new_video->mime_type);
-    }
-    if (v->duration != new_video->duration || v->precise_duration != new_video->precise_duration ||
-        v->dimensions != new_video->dimensions || v->supports_streaming != new_video->supports_streaming ||
-        v->is_animation != new_video->is_animation || v->preload_prefix_size != new_video->preload_prefix_size ||
+    if (v->mime_type != new_video->mime_type || v->file_name != new_video->file_name ||
+        v->minithumbnail != new_video->minithumbnail || v->thumbnail != new_video->thumbnail ||
+        v->animated_thumbnail != new_video->animated_thumbnail || v->duration != new_video->duration ||
+        v->precise_duration != new_video->precise_duration || v->dimensions != new_video->dimensions ||
+        v->supports_streaming != new_video->supports_streaming || v->is_animation != new_video->is_animation ||
+        v->preload_prefix_size != new_video->preload_prefix_size ||
         std::fabs(v->start_ts - new_video->start_ts) > 1e-3 || v->codec != new_video->codec) {
       LOG(DEBUG) << "Video " << file_id << " info has changed";
+      v->mime_type = std::move(new_video->mime_type);
+      v->file_name = std::move(new_video->file_name);
+      v->minithumbnail = std::move(new_video->minithumbnail);
+      v->thumbnail = std::move(new_video->thumbnail);
+      v->animated_thumbnail = std::move(new_video->animated_thumbnail);
       v->duration = new_video->duration;
       v->precise_duration = new_video->precise_duration;
       v->dimensions = new_video->dimensions;
@@ -117,31 +121,6 @@ FileId VideosManager::on_get_video(unique_ptr<Video> new_video, bool replace) {
       v->preload_prefix_size = new_video->preload_prefix_size;
       v->start_ts = new_video->start_ts;
       v->codec = std::move(new_video->codec);
-    }
-    if (v->file_name != new_video->file_name) {
-      LOG(DEBUG) << "Video " << file_id << " file name has changed";
-      v->file_name = std::move(new_video->file_name);
-    }
-    if (v->minithumbnail != new_video->minithumbnail) {
-      v->minithumbnail = std::move(new_video->minithumbnail);
-    }
-    if (v->thumbnail != new_video->thumbnail) {
-      if (!v->thumbnail.file_id.is_valid()) {
-        LOG(DEBUG) << "Video " << file_id << " thumbnail has changed";
-      } else {
-        LOG(INFO) << "Video " << file_id << " thumbnail has changed from " << v->thumbnail << " to "
-                  << new_video->thumbnail;
-      }
-      v->thumbnail = std::move(new_video->thumbnail);
-    }
-    if (v->animated_thumbnail != new_video->animated_thumbnail) {
-      if (!v->animated_thumbnail.file_id.is_valid()) {
-        LOG(DEBUG) << "Video " << file_id << " animated thumbnail has changed";
-      } else {
-        LOG(INFO) << "Video " << file_id << " animated thumbnail has changed from " << v->animated_thumbnail << " to "
-                  << new_video->animated_thumbnail;
-      }
-      v->animated_thumbnail = std::move(new_video->animated_thumbnail);
     }
     if (v->has_stickers != new_video->has_stickers && new_video->has_stickers) {
       v->has_stickers = new_video->has_stickers;
@@ -267,10 +246,24 @@ SecretInputMedia VideosManager::get_secret_input_media(
 
 tl_object_ptr<telegram_api::InputMedia> VideosManager::get_input_media(
     FileId file_id, telegram_api::object_ptr<telegram_api::InputFile> input_file,
-    telegram_api::object_ptr<telegram_api::InputFile> input_thumbnail, int32 ttl, bool has_spoiler) const {
+    telegram_api::object_ptr<telegram_api::InputFile> input_thumbnail, const Photo &cover, int32 start_timestamp,
+    int32 ttl, bool has_spoiler) const {
   if (!file_id.is_valid()) {
     LOG_IF(ERROR, ttl == 0) << "Video has invalid file_id";
     return nullptr;
+  }
+  telegram_api::object_ptr<telegram_api::InputPhoto> input_cover;
+  if (!cover.is_empty()) {
+    auto cover_file_id = get_photo_any_file_id(cover);
+    if (cover_file_id.is_valid()) {
+      auto cover_file_view = td_->file_manager_->get_file_view(cover_file_id);
+      if (!cover_file_view.is_encrypted()) {
+        const auto *main_remote_location = cover_file_view.get_main_remote_location();
+        if (main_remote_location != nullptr && !main_remote_location->is_web()) {
+          input_cover = main_remote_location->as_input_photo();
+        }
+      }
+    }
   }
   auto file_view = td_->file_manager_->get_file_view(file_id);
   if (file_view.is_encrypted()) {
@@ -285,8 +278,15 @@ tl_object_ptr<telegram_api::InputMedia> VideosManager::get_input_media(
     if (has_spoiler) {
       flags |= telegram_api::inputMediaDocument::SPOILER_MASK;
     }
-    return make_tl_object<telegram_api::inputMediaDocument>(flags, false /*ignored*/,
-                                                            main_remote_location->as_input_document(), ttl, string());
+    if (start_timestamp != 0) {
+      flags |= telegram_api::inputMediaDocument::VIDEO_TIMESTAMP_MASK;
+    }
+    if (input_cover != nullptr) {
+      flags |= telegram_api::inputMediaDocument::VIDEO_COVER_MASK;
+    }
+    return telegram_api::make_object<telegram_api::inputMediaDocument>(
+        flags, false /*ignored*/, main_remote_location->as_input_document(), std::move(input_cover), start_timestamp,
+        ttl, string());
   }
   const auto *url = file_view.get_url();
   if (url != nullptr) {
@@ -297,7 +297,14 @@ tl_object_ptr<telegram_api::InputMedia> VideosManager::get_input_media(
     if (has_spoiler) {
       flags |= telegram_api::inputMediaDocumentExternal::SPOILER_MASK;
     }
-    return make_tl_object<telegram_api::inputMediaDocumentExternal>(flags, false /*ignored*/, *url, ttl);
+    if (start_timestamp != 0) {
+      flags |= telegram_api::inputMediaDocumentExternal::VIDEO_TIMESTAMP_MASK;
+    }
+    if (input_cover != nullptr) {
+      flags |= telegram_api::inputMediaDocumentExternal::VIDEO_COVER_MASK;
+    }
+    return telegram_api::make_object<telegram_api::inputMediaDocumentExternal>(flags, false /*ignored*/, *url, ttl,
+                                                                               std::move(input_cover), start_timestamp);
   }
 
   if (input_file != nullptr) {
@@ -342,9 +349,16 @@ tl_object_ptr<telegram_api::InputMedia> VideosManager::get_input_media(
     if (has_spoiler) {
       flags |= telegram_api::inputMediaUploadedDocument::SPOILER_MASK;
     }
-    return make_tl_object<telegram_api::inputMediaUploadedDocument>(
+    if (start_timestamp != 0) {
+      flags |= telegram_api::inputMediaUploadedDocument::VIDEO_TIMESTAMP_MASK;
+    }
+    if (input_cover != nullptr) {
+      flags |= telegram_api::inputMediaUploadedDocument::VIDEO_COVER_MASK;
+    }
+    return telegram_api::make_object<telegram_api::inputMediaUploadedDocument>(
         flags, false /*ignored*/, false /*ignored*/, false /*ignored*/, std::move(input_file),
-        std::move(input_thumbnail), mime_type, std::move(attributes), std::move(added_stickers), ttl);
+        std::move(input_thumbnail), mime_type, std::move(attributes), std::move(added_stickers), std::move(input_cover),
+        start_timestamp, ttl);
   } else {
     CHECK(main_remote_location == nullptr);
   }
@@ -398,7 +412,7 @@ telegram_api::object_ptr<telegram_api::InputMedia> VideosManager::get_story_docu
   return telegram_api::make_object<telegram_api::inputMediaUploadedDocument>(
       flags, false /*ignored*/, false /*ignored*/, false /*ignored*/,
       telegram_api::make_object<telegram_api::inputFileStoryDocument>(main_remote_location->as_input_document()),
-      nullptr, mime_type, std::move(attributes), std::move(added_stickers), 0);
+      nullptr, mime_type, std::move(attributes), std::move(added_stickers), nullptr, 0, 0);
 }
 
 string VideosManager::get_video_search_text(FileId file_id) const {

@@ -1,5 +1,5 @@
 //
-// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2024
+// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2025
 //
 // Distributed under the Boost Software License, Version 1.0. (See accompanying
 // file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
@@ -175,41 +175,17 @@ FileId AnimationsManager::on_get_animation(unique_ptr<Animation> new_animation, 
     a = std::move(new_animation);
   } else if (replace) {
     CHECK(a->file_id == file_id);
-    if (a->mime_type != new_animation->mime_type) {
+    if (a->mime_type != new_animation->mime_type || a->file_name != new_animation->file_name ||
+        a->dimensions != new_animation->dimensions || a->duration != new_animation->duration ||
+        a->minithumbnail != new_animation->minithumbnail || a->thumbnail != new_animation->thumbnail ||
+        a->animated_thumbnail != new_animation->animated_thumbnail) {
       LOG(DEBUG) << "Animation " << file_id << " info has changed";
       a->mime_type = std::move(new_animation->mime_type);
-    }
-    if (a->file_name != new_animation->file_name) {
-      LOG(DEBUG) << "Animation " << file_id << " file name has changed";
       a->file_name = std::move(new_animation->file_name);
-    }
-    if (a->dimensions != new_animation->dimensions) {
-      LOG(DEBUG) << "Animation " << file_id << " dimensions have changed";
       a->dimensions = new_animation->dimensions;
-    }
-    if (a->duration != new_animation->duration) {
-      LOG(DEBUG) << "Animation " << file_id << " duration has changed";
       a->duration = new_animation->duration;
-    }
-    if (a->minithumbnail != new_animation->minithumbnail) {
       a->minithumbnail = std::move(new_animation->minithumbnail);
-    }
-    if (a->thumbnail != new_animation->thumbnail) {
-      if (!a->thumbnail.file_id.is_valid()) {
-        LOG(DEBUG) << "Animation " << file_id << " thumbnail has changed";
-      } else {
-        LOG(INFO) << "Animation " << file_id << " thumbnail has changed from " << a->thumbnail << " to "
-                  << new_animation->thumbnail;
-      }
       a->thumbnail = std::move(new_animation->thumbnail);
-    }
-    if (a->animated_thumbnail != new_animation->animated_thumbnail) {
-      if (!a->animated_thumbnail.file_id.is_valid()) {
-        LOG(DEBUG) << "Animation " << file_id << " animated thumbnail has changed";
-      } else {
-        LOG(INFO) << "Animation " << file_id << " animated thumbnail has changed from " << a->animated_thumbnail
-                  << " to " << new_animation->animated_thumbnail;
-      }
       a->animated_thumbnail = std::move(new_animation->animated_thumbnail);
     }
     if (a->has_stickers != new_animation->has_stickers && new_animation->has_stickers) {
@@ -314,8 +290,8 @@ tl_object_ptr<telegram_api::InputMedia> AnimationsManager::get_input_media(
     if (has_spoiler) {
       flags |= telegram_api::inputMediaDocument::SPOILER_MASK;
     }
-    return make_tl_object<telegram_api::inputMediaDocument>(flags, false /*ignored*/,
-                                                            main_remote_location->as_input_document(), 0, string());
+    return telegram_api::make_object<telegram_api::inputMediaDocument>(
+        flags, false /*ignored*/, main_remote_location->as_input_document(), nullptr, 0, 0, string());
   }
   const auto *url = file_view.get_url();
   if (url != nullptr) {
@@ -323,7 +299,8 @@ tl_object_ptr<telegram_api::InputMedia> AnimationsManager::get_input_media(
     if (has_spoiler) {
       flags |= telegram_api::inputMediaDocumentExternal::SPOILER_MASK;
     }
-    return make_tl_object<telegram_api::inputMediaDocumentExternal>(flags, false /*ignored*/, *url, 0);
+    return telegram_api::make_object<telegram_api::inputMediaDocumentExternal>(flags, false /*ignored*/, *url, 0,
+                                                                               nullptr, 0);
   }
 
   if (input_file != nullptr) {
@@ -358,9 +335,9 @@ tl_object_ptr<telegram_api::InputMedia> AnimationsManager::get_input_media(
     if (has_spoiler) {
       flags |= telegram_api::inputMediaUploadedDocument::SPOILER_MASK;
     }
-    return make_tl_object<telegram_api::inputMediaUploadedDocument>(
+    return telegram_api::make_object<telegram_api::inputMediaUploadedDocument>(
         flags, false /*ignored*/, false /*ignored*/, false /*ignored*/, std::move(input_file),
-        std::move(input_thumbnail), mime_type, std::move(attributes), std::move(added_stickers), 0);
+        std::move(input_thumbnail), mime_type, std::move(attributes), std::move(added_stickers), nullptr, 0, 0);
   } else {
     CHECK(main_remote_location == nullptr);
   }
@@ -616,8 +593,8 @@ void AnimationsManager::on_get_saved_animations(
       continue;
     }
     CHECK(document_constructor_id == telegram_api::document::ID);
-    auto document =
-        td_->documents_manager_->on_get_document(move_tl_object_as<telegram_api::document>(document_ptr), DialogId());
+    auto document = td_->documents_manager_->on_get_document(move_tl_object_as<telegram_api::document>(document_ptr),
+                                                             DialogId(), false);
     if (document.type != Document::Type::Animation) {
       LOG(ERROR) << "Receive " << document << " instead of animation as saved animation";
       continue;

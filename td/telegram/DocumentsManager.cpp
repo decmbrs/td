@@ -1,5 +1,5 @@
 //
-// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2024
+// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2025
 //
 // Distributed under the Boost Software License, Version 1.0. (See accompanying
 // file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
@@ -72,7 +72,7 @@ tl_object_ptr<td_api::document> DocumentsManager::get_document_object(FileId fil
 }
 
 Document DocumentsManager::on_get_document(RemoteDocument remote_document, DialogId owner_dialog_id,
-                                           MultiPromiseActor *load_data_multipromise_ptr,
+                                           bool is_self_destructing, MultiPromiseActor *load_data_multipromise_ptr,
                                            Document::Type default_document_type, Subtype document_subtype) {
   tl_object_ptr<telegram_api::documentAttributeAnimated> animated;
   tl_object_ptr<telegram_api::documentAttributeVideo> video;
@@ -147,6 +147,10 @@ Document DocumentsManager::on_get_document(RemoteDocument remote_document, Dialo
       type_attributes--;
       audio = nullptr;
     }
+    if (animated != nullptr && default_document_type == Document::Type::Video) {
+      type_attributes--;
+      animated = nullptr;
+    }
 
     if (animated != nullptr) {
       type_attributes--;
@@ -167,6 +171,11 @@ Document DocumentsManager::on_get_document(RemoteDocument remote_document, Dialo
       type_attributes--;
       video = nullptr;
     }
+  } else if (animated != nullptr && default_document_type == Document::Type::Video) {
+    LOG(ERROR) << "Receive " << to_string(remote_document.document) << " with " << to_string(animated)
+               << " and without video";
+    type_attributes--;
+    animated = nullptr;
   }
   if (animated != nullptr && audio != nullptr) {
     // animation send as audio
@@ -204,7 +213,7 @@ Document DocumentsManager::on_get_document(RemoteDocument remote_document, Dialo
       }
       if (is_voice_note) {
         document_type = Document::Type::VoiceNote;
-        file_type = FileType::VoiceNote;
+        file_type = is_self_destructing ? FileType::SelfDestructingVoiceNote : FileType::VoiceNote;
         default_extension = Slice("oga");
         file_name.clear();
       } else {
@@ -231,11 +240,11 @@ Document DocumentsManager::on_get_document(RemoteDocument remote_document, Dialo
       }
       if (is_video_note) {
         document_type = Document::Type::VideoNote;
-        file_type = FileType::VideoNote;
+        file_type = is_self_destructing ? FileType::SelfDestructingVideoNote : FileType::VideoNote;
         file_name.clear();
       } else {
         document_type = Document::Type::Video;
-        file_type = FileType::Video;
+        file_type = is_self_destructing ? FileType::SelfDestructingVideo : FileType::Video;
       }
       default_extension = Slice("mp4");
     }
@@ -581,24 +590,11 @@ FileId DocumentsManager::on_get_document(unique_ptr<GeneralDocument> new_documen
     d = std::move(new_document);
   } else if (replace) {
     CHECK(d->file_id == new_document->file_id);
-    if (d->mime_type != new_document->mime_type) {
-      LOG(DEBUG) << "Document " << file_id << " mime_type has changed";
+    if (d->mime_type != new_document->mime_type || d->file_name != new_document->file_name ||
+        d->minithumbnail != new_document->minithumbnail || d->thumbnail != new_document->thumbnail) {
       d->mime_type = std::move(new_document->mime_type);
-    }
-    if (d->file_name != new_document->file_name) {
-      LOG(DEBUG) << "Document " << file_id << " file_name has changed";
       d->file_name = std::move(new_document->file_name);
-    }
-    if (d->minithumbnail != new_document->minithumbnail) {
       d->minithumbnail = std::move(new_document->minithumbnail);
-    }
-    if (d->thumbnail != new_document->thumbnail) {
-      if (!d->thumbnail.file_id.is_valid()) {
-        LOG(DEBUG) << "Document " << file_id << " thumbnail has changed";
-      } else {
-        LOG(INFO) << "Document " << file_id << " thumbnail has changed from " << d->thumbnail << " to "
-                  << new_document->thumbnail;
-      }
       d->thumbnail = std::move(new_document->thumbnail);
     }
   }
@@ -665,12 +661,13 @@ tl_object_ptr<telegram_api::InputMedia> DocumentsManager::get_input_media(
   }
   const auto *main_remote_location = file_view.get_main_remote_location();
   if (main_remote_location != nullptr && !main_remote_location->is_web() && input_file == nullptr) {
-    return make_tl_object<telegram_api::inputMediaDocument>(0, false /*ignored*/,
-                                                            main_remote_location->as_input_document(), 0, string());
+    return telegram_api::make_object<telegram_api::inputMediaDocument>(
+        0, false /*ignored*/, main_remote_location->as_input_document(), nullptr, 0, 0, string());
   }
   const auto *url = file_view.get_url();
   if (url != nullptr) {
-    return make_tl_object<telegram_api::inputMediaDocumentExternal>(0, false /*ignored*/, *url, 0);
+    return telegram_api::make_object<telegram_api::inputMediaDocumentExternal>(0, false /*ignored*/, *url, 0, nullptr,
+                                                                               0);
   }
 
   if (input_file != nullptr) {
@@ -689,10 +686,10 @@ tl_object_ptr<telegram_api::InputMedia> DocumentsManager::get_input_media(
     if (file_type == FileType::DocumentAsFile) {
       flags |= telegram_api::inputMediaUploadedDocument::FORCE_FILE_MASK;
     }
-    return make_tl_object<telegram_api::inputMediaUploadedDocument>(
+    return telegram_api::make_object<telegram_api::inputMediaUploadedDocument>(
         flags, false /*ignored*/, false /*ignored*/, false /*ignored*/, std::move(input_file),
         std::move(input_thumbnail), document->mime_type, std::move(attributes),
-        vector<tl_object_ptr<telegram_api::InputDocument>>(), 0);
+        vector<telegram_api::object_ptr<telegram_api::InputDocument>>(), nullptr, 0, 0);
   } else {
     CHECK(main_remote_location == nullptr);
   }

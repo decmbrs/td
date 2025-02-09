@@ -1,5 +1,5 @@
 //
-// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2024
+// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2025
 //
 // Distributed under the Boost Software License, Version 1.0. (See accompanying
 // file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
@@ -101,33 +101,17 @@ FileId AudiosManager::on_get_audio(unique_ptr<Audio> new_audio, bool replace) {
     a = std::move(new_audio);
   } else if (replace) {
     CHECK(a->file_id == new_audio->file_id);
-    if (a->mime_type != new_audio->mime_type) {
+    if (a->mime_type != new_audio->mime_type || a->duration != new_audio->duration || a->title != new_audio->title ||
+        a->performer != new_audio->performer || a->file_name != new_audio->file_name || a->date != new_audio->date ||
+        a->minithumbnail != new_audio->minithumbnail || a->thumbnail != new_audio->thumbnail) {
       LOG(DEBUG) << "Audio " << file_id << " info has changed";
       a->mime_type = std::move(new_audio->mime_type);
-    }
-    if (a->duration != new_audio->duration || a->title != new_audio->title || a->performer != new_audio->performer) {
-      LOG(DEBUG) << "Audio " << file_id << " info has changed";
       a->duration = new_audio->duration;
       a->title = std::move(new_audio->title);
       a->performer = std::move(new_audio->performer);
-    }
-    if (a->file_name != new_audio->file_name) {
-      LOG(DEBUG) << "Audio " << file_id << " file name has changed";
       a->file_name = std::move(new_audio->file_name);
-    }
-    if (a->date != new_audio->date) {
       a->date = new_audio->date;
-    }
-    if (a->minithumbnail != new_audio->minithumbnail) {
       a->minithumbnail = std::move(new_audio->minithumbnail);
-    }
-    if (a->thumbnail != new_audio->thumbnail) {
-      if (!a->thumbnail.file_id.is_valid()) {
-        LOG(DEBUG) << "Audio " << file_id << " thumbnail has changed";
-      } else {
-        LOG(INFO) << "Audio " << file_id << " thumbnail has changed from " << a->thumbnail << " to "
-                  << new_audio->thumbnail;
-      }
       a->thumbnail = std::move(new_audio->thumbnail);
     }
   }
@@ -271,12 +255,13 @@ tl_object_ptr<telegram_api::InputMedia> AudiosManager::get_input_media(
   }
   const auto *main_remote_location = file_view.get_main_remote_location();
   if (main_remote_location != nullptr && !main_remote_location->is_web() && input_file == nullptr) {
-    return make_tl_object<telegram_api::inputMediaDocument>(0, false /*ignored*/,
-                                                            main_remote_location->as_input_document(), 0, string());
+    return telegram_api::make_object<telegram_api::inputMediaDocument>(
+        0, false /*ignored*/, main_remote_location->as_input_document(), nullptr, 0, 0, string());
   }
   const auto *url = file_view.get_url();
   if (url != nullptr) {
-    return make_tl_object<telegram_api::inputMediaDocumentExternal>(0, false /*ignored*/, *url, 0);
+    return telegram_api::make_object<telegram_api::inputMediaDocumentExternal>(0, false /*ignored*/, *url, 0, nullptr,
+                                                                               0);
   }
 
   if (input_file != nullptr) {
@@ -298,10 +283,10 @@ tl_object_ptr<telegram_api::InputMedia> AudiosManager::get_input_media(
     if (input_thumbnail != nullptr) {
       flags |= telegram_api::inputMediaUploadedDocument::THUMB_MASK;
     }
-    return make_tl_object<telegram_api::inputMediaUploadedDocument>(
+    return telegram_api::make_object<telegram_api::inputMediaUploadedDocument>(
         flags, false /*ignored*/, false /*ignored*/, false /*ignored*/, std::move(input_file),
         std::move(input_thumbnail), mime_type, std::move(attributes),
-        vector<tl_object_ptr<telegram_api::InputDocument>>(), 0);
+        vector<telegram_api::object_ptr<telegram_api::InputDocument>>(), nullptr, 0, 0);
   } else {
     CHECK(main_remote_location == nullptr);
   }

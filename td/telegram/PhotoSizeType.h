@@ -1,5 +1,5 @@
 //
-// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2024
+// Copyright Aliaksei Levin (levlam@telegram.org), Arseny Smirnov (arseny30@gmail.com) 2014-2025
 //
 // Distributed under the Boost Software License, Version 1.0. (See accompanying
 // file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
@@ -33,15 +33,15 @@ inline bool operator==(const PhotoSizeType &lhs, const PhotoSizeType &rhs) {
 }
 
 inline bool operator!=(const PhotoSizeType &lhs, char c) {
-  return lhs.type == c;
+  return !(lhs == c);
 }
 
 inline bool operator!=(const PhotoSizeType &lhs, int32 type) {
-  return lhs.type == type;
+  return !(lhs == type);
 }
 
 inline bool operator!=(const PhotoSizeType &lhs, const PhotoSizeType &rhs) {
-  return lhs.type != rhs.type;
+  return !(lhs == rhs);
 }
 
 inline StringBuilder &operator<<(StringBuilder &string_builder, const PhotoSizeType &photo_size_type) {
