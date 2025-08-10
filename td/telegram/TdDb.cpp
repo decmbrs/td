@@ -295,7 +295,6 @@ void TdDb::do_close(bool destroy_flag, Promise<Unit> on_finished) {
   mpas.add_promise(PromiseCreator::lambda(
       [promise = std::move(on_finished), sql_connection = std::move(sql_connection_), destroy_flag](Unit) mutable {
         if (sql_connection) {
-          LOG_CHECK(sql_connection.unique()) << sql_connection.use_count();
           if (destroy_flag) {
             sql_connection->close_and_destroy();
           } else {
@@ -338,9 +337,7 @@ void TdDb::do_close(bool destroy_flag, Promise<Unit> on_finished) {
   }
 
   // binlog_pmc is dependent on binlog_ and anyway it doesn't support close_and_destroy
-  CHECK(binlog_pmc_.unique());
   binlog_pmc_.reset();
-  CHECK(config_pmc_.unique());
   config_pmc_.reset();
 
   if (binlog_) {
@@ -566,7 +563,7 @@ void TdDb::open_impl(Parameters parameters, Promise<OpenedDatabase> &&promise) {
     SqliteDb::destroy(get_sqlite_path(parameters)).ignore();
     init_sqlite_status = db->init_sqlite(parameters, new_sqlite_key, old_sqlite_key, *binlog_pmc);
     if (init_sqlite_status.is_error()) {
-      return promise.set_error(Status::Error(400, init_sqlite_status.message()));
+      return promise.set_error(400, init_sqlite_status.message());
     }
   }
   if (drop_sqlite_key) {

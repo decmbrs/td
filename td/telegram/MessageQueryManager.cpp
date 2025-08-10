@@ -14,6 +14,7 @@
 #include "td/telegram/DialogManager.h"
 #include "td/telegram/DialogParticipant.h"
 #include "td/telegram/DialogParticipantManager.h"
+#include "td/telegram/FactCheck.h"
 #include "td/telegram/files/FileManager.h"
 #include "td/telegram/files/FileType.h"
 #include "td/telegram/FolderId.h"
@@ -22,15 +23,20 @@
 #include "td/telegram/logevent/LogEvent.h"
 #include "td/telegram/logevent/LogEventHelper.h"
 #include "td/telegram/MessageContent.h"
+#include "td/telegram/MessageContentType.h"
 #include "td/telegram/MessageEntity.h"
+#include "td/telegram/MessageReaction.h"
 #include "td/telegram/MessageSearchOffset.h"
+#include "td/telegram/MessageSender.h"
 #include "td/telegram/MessagesInfo.h"
 #include "td/telegram/MessagesManager.h"
+#include "td/telegram/PublicDialogType.h"
 #include "td/telegram/SecretChatsManager.h"
 #include "td/telegram/ServerMessageId.h"
 #include "td/telegram/Td.h"
 #include "td/telegram/TdDb.h"
 #include "td/telegram/telegram_api.h"
+#include "td/telegram/ToDoItem.h"
 #include "td/telegram/UpdatesManager.h"
 #include "td/telegram/UserId.h"
 #include "td/telegram/UserManager.h"
@@ -40,10 +46,10 @@
 #include "td/db/binlog/BinlogHelper.h"
 
 #include "td/actor/MultiPromise.h"
+#include "td/actor/SleepActor.h"
 
 #include "td/utils/algorithm.h"
 #include "td/utils/buffer.h"
-#include "td/utils/format.h"
 #include "td/utils/logging.h"
 #include "td/utils/misc.h"
 #include "td/utils/SliceBuilder.h"
@@ -51,6 +57,8 @@
 #include "td/utils/Time.h"
 #include "td/utils/tl_helpers.h"
 
+#include <limits>
+#include <map>
 #include <type_traits>
 
 namespace td {
@@ -125,6 +133,7 @@ class UploadCoverQuery final : public Td::ResultHandler {
 
 class ReportMessageDeliveryQuery final : public Td::ResultHandler {
   DialogId dialog_id_;
+  MessageId message_id_;
 
  public:
   void send(MessageFullId message_full_id, bool from_push) {
@@ -133,15 +142,10 @@ class ReportMessageDeliveryQuery final : public Td::ResultHandler {
     if (input_peer == nullptr) {
       return;
     }
-    int32 flags = 0;
-    if (from_push) {
-      flags |= telegram_api::messages_reportMessagesDelivery::PUSH_MASK;
-    }
-    auto message_id = message_full_id.get_message_id();
-    CHECK(message_id.is_valid());
-    CHECK(message_id.is_server());
+    message_id_ = message_full_id.get_message_id();
+    CHECK(message_id_.is_server());
     send_query(G()->net_query_creator().create(telegram_api::messages_reportMessagesDelivery(
-        flags, false /*ignored*/, std::move(input_peer), {message_id.get_server_message_id().get()})));
+        0, from_push, std::move(input_peer), {message_id_.get_server_message_id().get()})));
   }
 
   void on_result(BufferSlice packet) final {
@@ -154,7 +158,88 @@ class ReportMessageDeliveryQuery final : public Td::ResultHandler {
   }
 
   void on_error(Status status) final {
-    td_->dialog_manager_->on_get_dialog_error(dialog_id_, status, "ReportMessageDeliveryQuery");
+    td_->messages_manager_->on_get_message_error(dialog_id_, message_id_, status, "ReportMessageDeliveryQuery");
+  }
+};
+
+class SendBotRequestedPeerQuery final : public Td::ResultHandler {
+  Promise<Unit> promise_;
+
+ public:
+  explicit SendBotRequestedPeerQuery(Promise<Unit> &&promise) : promise_(std::move(promise)) {
+  }
+
+  void send(MessageFullId message_full_id, int32 button_id, vector<DialogId> &&requested_dialog_ids) {
+    auto dialog_id = message_full_id.get_dialog_id();
+    auto input_peer = td_->dialog_manager_->get_input_peer(dialog_id, AccessRights::Write);
+    if (input_peer == nullptr) {
+      return on_error(Status::Error(400, "Can't access the chat"));
+    }
+    vector<telegram_api::object_ptr<telegram_api::InputPeer>> requested_peers;
+    for (auto requested_dialog_id : requested_dialog_ids) {
+      auto requested_peer = td_->dialog_manager_->get_input_peer(requested_dialog_id, AccessRights::Read);
+      if (requested_peer == nullptr) {
+        return on_error(Status::Error(400, "Can't access the chosen chat"));
+      }
+      requested_peers.push_back(std::move(requested_peer));
+    }
+
+    send_query(G()->net_query_creator().create(
+        telegram_api::messages_sendBotRequestedPeer(std::move(input_peer),
+                                                    message_full_id.get_message_id().get_server_message_id().get(),
+                                                    button_id, std::move(requested_peers)),
+        {{dialog_id, MessageContentType::Text}}));
+  }
+
+  void on_result(BufferSlice packet) final {
+    auto result_ptr = fetch_result<telegram_api::messages_sendBotRequestedPeer>(packet);
+    if (result_ptr.is_error()) {
+      return on_error(result_ptr.move_as_error());
+    }
+
+    auto ptr = result_ptr.move_as_ok();
+    LOG(INFO) << "Receive result for SendBotRequestedPeerQuery: " << to_string(ptr);
+    td_->updates_manager_->on_get_updates(std::move(ptr), std::move(promise_));
+  }
+
+  void on_error(Status status) final {
+    promise_.set_error(std::move(status));
+  }
+};
+
+class GetExtendedMediaQuery final : public Td::ResultHandler {
+  DialogId dialog_id_;
+  vector<MessageId> message_ids_;
+
+ public:
+  void send(DialogId dialog_id, vector<MessageId> &&message_ids) {
+    dialog_id_ = dialog_id;
+    message_ids_ = std::move(message_ids);
+
+    auto input_peer = td_->dialog_manager_->get_input_peer(dialog_id, AccessRights::Read);
+    if (input_peer == nullptr) {
+      return on_error(Status::Error(400, "Can't access the chat"));
+    }
+
+    send_query(G()->net_query_creator().create(telegram_api::messages_getExtendedMedia(
+        std::move(input_peer), MessageId::get_server_message_ids(message_ids_))));
+  }
+
+  void on_result(BufferSlice packet) final {
+    auto result_ptr = fetch_result<telegram_api::messages_getExtendedMedia>(packet);
+    if (result_ptr.is_error()) {
+      return on_error(result_ptr.move_as_error());
+    }
+
+    auto ptr = result_ptr.move_as_ok();
+    LOG(INFO) << "Receive result for GetExtendedMediaQuery: " << to_string(ptr);
+    td_->updates_manager_->on_get_updates(std::move(ptr), Promise<Unit>());
+    td_->message_query_manager_->finish_get_message_extended_media(dialog_id_, message_ids_);
+  }
+
+  void on_error(Status status) final {
+    td_->dialog_manager_->on_get_dialog_error(dialog_id_, status, "GetExtendedMediaQuery");
+    td_->message_query_manager_->finish_get_message_extended_media(dialog_id_, message_ids_);
   }
 };
 
@@ -171,7 +256,7 @@ class GetFactCheckQuery final : public Td::ResultHandler {
     dialog_id_ = dialog_id;
     auto input_peer = td_->dialog_manager_->get_input_peer(dialog_id, AccessRights::Read);
     if (input_peer == nullptr) {
-      return promise_.set_error(Status::Error(400, "Can't access the chat"));
+      return promise_.set_error(400, "Can't access the chat");
     }
     send_query(G()->net_query_creator().create(
         telegram_api::messages_getFactCheck(std::move(input_peer), MessageId::get_server_message_ids(message_ids))));
@@ -197,6 +282,7 @@ class GetFactCheckQuery final : public Td::ResultHandler {
 class EditMessageFactCheckQuery final : public Td::ResultHandler {
   Promise<Unit> promise_;
   DialogId dialog_id_;
+  MessageId message_id_;
 
  public:
   explicit EditMessageFactCheckQuery(Promise<Unit> &&promise) : promise_(std::move(promise)) {
@@ -204,9 +290,9 @@ class EditMessageFactCheckQuery final : public Td::ResultHandler {
 
   void send(DialogId dialog_id, MessageId message_id, const FormattedText &text) {
     dialog_id_ = dialog_id;
+    message_id_ = message_id;
     auto input_peer = td_->dialog_manager_->get_input_peer(dialog_id, AccessRights::Read);
     CHECK(input_peer != nullptr);
-    CHECK(message_id.is_valid());
     CHECK(message_id.is_server());
     auto server_message_id = message_id.get_server_message_id().get();
     if (text.text.empty()) {
@@ -234,7 +320,51 @@ class EditMessageFactCheckQuery final : public Td::ResultHandler {
   }
 
   void on_error(Status status) final {
-    td_->dialog_manager_->on_get_dialog_error(dialog_id_, status, "EditMessageFactCheckQuery");
+    td_->messages_manager_->on_get_message_error(dialog_id_, message_id_, status, "EditMessageFactCheckQuery");
+    promise_.set_error(std::move(status));
+  }
+};
+
+class ToggleSuggestedPostApprovalQuery final : public Td::ResultHandler {
+  Promise<Unit> promise_;
+  DialogId dialog_id_;
+  MessageId message_id_;
+
+ public:
+  explicit ToggleSuggestedPostApprovalQuery(Promise<Unit> &&promise) : promise_(std::move(promise)) {
+  }
+
+  void send(DialogId dialog_id, MessageId message_id, bool is_rejected, int32 schedule_date, const string &comment) {
+    dialog_id_ = dialog_id;
+    message_id_ = message_id;
+    auto input_peer = td_->dialog_manager_->get_input_peer(dialog_id, AccessRights::Read);
+    CHECK(input_peer != nullptr);
+    CHECK(message_id.is_server());
+    auto server_message_id = message_id.get_server_message_id().get();
+    int32 flags = 0;
+    if (schedule_date) {
+      flags |= telegram_api::messages_toggleSuggestedPostApproval::SCHEDULE_DATE_MASK;
+    }
+    if (!comment.empty()) {
+      flags |= telegram_api::messages_toggleSuggestedPostApproval::REJECT_COMMENT_MASK;
+    }
+    send_query(G()->net_query_creator().create(telegram_api::messages_toggleSuggestedPostApproval(
+        flags, is_rejected, std::move(input_peer), server_message_id, schedule_date, comment)));
+  }
+
+  void on_result(BufferSlice packet) final {
+    auto result_ptr = fetch_result<telegram_api::messages_toggleSuggestedPostApproval>(packet);
+    if (result_ptr.is_error()) {
+      return on_error(result_ptr.move_as_error());
+    }
+
+    auto ptr = result_ptr.move_as_ok();
+    LOG(INFO) << "Receive result for ToggleSuggestedPostApprovalQuery: " << to_string(ptr);
+    td_->updates_manager_->on_get_updates(std::move(ptr), std::move(promise_));
+  }
+
+  void on_error(Status status) final {
+    td_->messages_manager_->on_get_message_error(dialog_id_, message_id_, status, "ToggleSuggestedPostApprovalQuery");
     promise_.set_error(std::move(status));
   }
 };
@@ -275,25 +405,28 @@ class SearchMessagesGlobalQuery final : public Td::ResultHandler {
     if (!ignore_folder_id) {
       flags |= telegram_api::messages_searchGlobal::FOLDER_ID_MASK;
     }
+    bool users_only = false;
+    bool groups_only = false;
+    bool broadcasts_only = false;
     if (dialog_type_filter != nullptr) {
       switch (dialog_type_filter->get_id()) {
         case td_api::searchMessagesChatTypeFilterPrivate::ID:
-          flags |= telegram_api::messages_searchGlobal::USERS_ONLY_MASK;
+          users_only = true;
           break;
         case td_api::searchMessagesChatTypeFilterGroup::ID:
-          flags |= telegram_api::messages_searchGlobal::GROUPS_ONLY_MASK;
+          groups_only = true;
           break;
         case td_api::searchMessagesChatTypeFilterChannel::ID:
-          flags |= telegram_api::messages_searchGlobal::BROADCASTS_ONLY_MASK;
+          broadcasts_only = true;
           break;
         default:
           UNREACHABLE();
       }
     }
     send_query(G()->net_query_creator().create(telegram_api::messages_searchGlobal(
-        flags, false /*ignored*/, false /*ignored*/, false /*ignored*/, folder_id.get(), query,
-        get_input_messages_filter(filter), min_date_, max_date_, offset_date_, std::move(input_peer),
-        offset_message_id.get_server_message_id().get(), limit)));
+        flags, broadcasts_only, groups_only, users_only, folder_id.get(), query, get_input_messages_filter(filter),
+        min_date_, max_date_, offset_date_, std::move(input_peer), offset_message_id.get_server_message_id().get(),
+        limit)));
   }
 
   void on_result(BufferSlice packet) final {
@@ -473,6 +606,165 @@ class GetRecentLocationsQuery final : public Td::ResultHandler {
   }
 };
 
+class GetMessagePositionQuery final : public Td::ResultHandler {
+  Promise<int32> promise_;
+  DialogId dialog_id_;
+  MessageId message_id_;
+  MessageSearchFilter filter_;
+  MessageTopic message_topic_;
+
+ public:
+  explicit GetMessagePositionQuery(Promise<int32> &&promise) : promise_(std::move(promise)) {
+  }
+
+  void send(DialogId dialog_id, MessageId message_id, MessageSearchFilter filter, MessageTopic message_topic) {
+    auto input_peer = td_->dialog_manager_->get_input_peer(dialog_id, AccessRights::Read);
+    CHECK(input_peer != nullptr);
+
+    dialog_id_ = dialog_id;
+    message_id_ = message_id;
+    message_topic_ = message_topic;
+    filter_ = filter;
+
+    auto saved_messages_topic_id = message_topic.get_any_saved_messages_topic_id();
+    telegram_api::object_ptr<telegram_api::InputPeer> saved_input_peer;
+    if (saved_messages_topic_id.is_valid()) {
+      saved_input_peer = saved_messages_topic_id.get_input_peer(td_);
+      CHECK(saved_input_peer != nullptr);
+    }
+    auto top_msg_id = message_topic.get_forum_topic_id().get_server_message_id().get();
+    if (filter == MessageSearchFilter::Empty && top_msg_id == 0) {
+      if (saved_messages_topic_id.is_valid()) {
+        int32 flags = 0;
+        if (message_topic_.is_monoforum()) {
+          flags |= telegram_api::messages_getSavedHistory::PARENT_PEER_MASK;
+        } else {
+          input_peer = nullptr;
+        }
+        send_query(G()->net_query_creator().create(
+            telegram_api::messages_getSavedHistory(flags, std::move(input_peer), std::move(saved_input_peer),
+                                                   message_id.get_server_message_id().get(), 0, -1, 1, 0, 0, 0)));
+      } else {
+        send_query(G()->net_query_creator().create(telegram_api::messages_getHistory(
+            std::move(input_peer), message_id.get_server_message_id().get(), 0, -1, 1, 0, 0, 0)));
+      }
+    } else {
+      int32 flags = 0;
+      if (saved_input_peer != nullptr) {
+        flags |= telegram_api::messages_search::SAVED_PEER_ID_MASK;
+      }
+      if (top_msg_id != 0) {
+        flags |= telegram_api::messages_search::TOP_MSG_ID_MASK;
+      }
+      send_query(G()->net_query_creator().create(telegram_api::messages_search(
+          flags, std::move(input_peer), string(), nullptr, std::move(saved_input_peer), Auto(), top_msg_id,
+          get_input_messages_filter(filter), 0, std::numeric_limits<int32>::max(),
+          message_id.get_server_message_id().get(), -1, 1, std::numeric_limits<int32>::max(), 0, 0)));
+    }
+  }
+
+  void on_result(BufferSlice packet) final {
+    auto result_ptr = fetch_result<telegram_api::messages_search>(packet);
+    if (result_ptr.is_error()) {
+      return on_error(result_ptr.move_as_error());
+    }
+
+    auto messages_ptr = result_ptr.move_as_ok();
+    LOG(INFO) << "Receive result for GetMessagePositionQuery: " << to_string(messages_ptr);
+    switch (messages_ptr->get_id()) {
+      case telegram_api::messages_messages::ID: {
+        auto messages = telegram_api::move_object_as<telegram_api::messages_messages>(messages_ptr);
+        if (messages->messages_.size() != 1 ||
+            MessageId::get_message_id(messages->messages_[0], false) != message_id_) {
+          return promise_.set_error(400, "Message not found by the filter");
+        }
+        return promise_.set_value(narrow_cast<int32>(messages->messages_.size()));
+      }
+      case telegram_api::messages_messagesSlice::ID: {
+        auto messages = telegram_api::move_object_as<telegram_api::messages_messagesSlice>(messages_ptr);
+        if (messages->messages_.size() != 1 ||
+            MessageId::get_message_id(messages->messages_[0], false) != message_id_) {
+          return promise_.set_error(400, "Message not found by the filter");
+        }
+        if (messages->offset_id_offset_ <= 0) {
+          LOG(ERROR) << "Failed to receive position for " << message_id_ << " in " << message_topic_ << " in "
+                     << dialog_id_ << " by " << filter_;
+          return promise_.set_error(400, "Message position is unknown");
+        }
+        return promise_.set_value(std::move(messages->offset_id_offset_));
+      }
+      case telegram_api::messages_channelMessages::ID: {
+        auto messages = telegram_api::move_object_as<telegram_api::messages_channelMessages>(messages_ptr);
+        if (messages->messages_.size() != 1 ||
+            MessageId::get_message_id(messages->messages_[0], false) != message_id_) {
+          return promise_.set_error(400, "Message not found by the filter");
+        }
+        if (messages->offset_id_offset_ <= 0) {
+          LOG(ERROR) << "Failed to receive position for " << message_id_ << " in " << dialog_id_ << " by " << filter_;
+          return promise_.set_error(500, "Message position is unknown");
+        }
+        return promise_.set_value(std::move(messages->offset_id_offset_));
+      }
+      case telegram_api::messages_messagesNotModified::ID:
+        LOG(ERROR) << "Server returned messagesNotModified in response to GetMessagePositionQuery";
+        return promise_.set_error(500, "Receive invalid response");
+      default:
+        UNREACHABLE();
+        break;
+    }
+  }
+
+  void on_error(Status status) final {
+    td_->messages_manager_->on_get_message_error(dialog_id_, message_id_, status, "GetMessagePositionQuery");
+    promise_.set_error(std::move(status));
+  }
+};
+
+class GetOutboxReadDateQuery final : public Td::ResultHandler {
+  Promise<td_api::object_ptr<td_api::MessageReadDate>> promise_;
+  DialogId dialog_id_;
+  MessageId message_id_;
+
+ public:
+  explicit GetOutboxReadDateQuery(Promise<td_api::object_ptr<td_api::MessageReadDate>> &&promise)
+      : promise_(std::move(promise)) {
+  }
+
+  void send(DialogId dialog_id, MessageId message_id) {
+    dialog_id_ = dialog_id;
+    message_id_ = message_id;
+    auto input_peer = td_->dialog_manager_->get_input_peer(dialog_id, AccessRights::Read);
+    CHECK(input_peer != nullptr);
+    send_query(G()->net_query_creator().create(
+        telegram_api::messages_getOutboxReadDate(std::move(input_peer), message_id.get_server_message_id().get())));
+  }
+
+  void on_result(BufferSlice packet) final {
+    auto result_ptr = fetch_result<telegram_api::messages_getOutboxReadDate>(packet);
+    if (result_ptr.is_error()) {
+      return on_error(result_ptr.move_as_error());
+    }
+
+    auto ptr = result_ptr.move_as_ok();
+    promise_.set_value(td_api::make_object<td_api::messageReadDateRead>(ptr->date_));
+  }
+
+  void on_error(Status status) final {
+    if (status.message() == "USER_PRIVACY_RESTRICTED") {
+      return promise_.set_value(td_api::make_object<td_api::messageReadDateUserPrivacyRestricted>());
+    }
+    if (status.message() == "YOUR_PRIVACY_RESTRICTED") {
+      return promise_.set_value(td_api::make_object<td_api::messageReadDateMyPrivacyRestricted>());
+    }
+    if (status.message() == "MESSAGE_TOO_OLD") {
+      return promise_.set_value(td_api::make_object<td_api::messageReadDateTooOld>());
+    }
+
+    td_->messages_manager_->on_get_message_error(dialog_id_, message_id_, status, "GetOutboxReadDateQuery");
+    promise_.set_error(std::move(status));
+  }
+};
+
 class GetMessageReadParticipantsQuery final : public Td::ResultHandler {
   Promise<MessageViewers> promise_;
   DialogId dialog_id_;
@@ -502,6 +794,183 @@ class GetMessageReadParticipantsQuery final : public Td::ResultHandler {
 
   void on_error(Status status) final {
     td_->messages_manager_->on_get_message_error(dialog_id_, message_id_, status, "GetMessageReadParticipantsQuery");
+    promise_.set_error(std::move(status));
+  }
+};
+
+class GetMessagesViewsQuery final : public Td::ResultHandler {
+  DialogId dialog_id_;
+  vector<MessageId> message_ids_;
+
+ public:
+  void send(DialogId dialog_id, vector<MessageId> &&message_ids, bool increment_view_counter) {
+    dialog_id_ = dialog_id;
+    message_ids_ = std::move(message_ids);
+
+    auto input_peer = td_->dialog_manager_->get_input_peer(dialog_id, AccessRights::Read);
+    if (input_peer == nullptr) {
+      return on_error(Status::Error(400, "Can't access the chat"));
+    }
+
+    send_query(G()->net_query_creator().create(telegram_api::messages_getMessagesViews(
+        std::move(input_peer), MessageId::get_server_message_ids(message_ids_), increment_view_counter)));
+  }
+
+  void on_result(BufferSlice packet) final {
+    auto result_ptr = fetch_result<telegram_api::messages_getMessagesViews>(packet);
+    if (result_ptr.is_error()) {
+      return on_error(result_ptr.move_as_error());
+    }
+
+    auto result = result_ptr.move_as_ok();
+    auto interaction_infos = std::move(result->views_);
+    if (message_ids_.size() != interaction_infos.size()) {
+      return on_error(Status::Error(500, "Wrong number of message views returned"));
+    }
+    td_->user_manager_->on_get_users(std::move(result->users_), "GetMessagesViewsQuery");
+    td_->chat_manager_->on_get_chats(std::move(result->chats_), "GetMessagesViewsQuery");
+    for (size_t i = 0; i < message_ids_.size(); i++) {
+      MessageFullId message_full_id{dialog_id_, message_ids_[i]};
+      auto *info = interaction_infos[i].get();
+      td_->messages_manager_->on_update_message_interaction_info(message_full_id, info->views_, info->forwards_, true,
+                                                                 std::move(info->replies_));
+    }
+    td_->message_query_manager_->finish_get_message_views(dialog_id_, message_ids_);
+  }
+
+  void on_error(Status status) final {
+    if (!td_->dialog_manager_->on_get_dialog_error(dialog_id_, status, "GetMessagesViewsQuery")) {
+      LOG(ERROR) << "Receive error for GetMessagesViewsQuery: " << status;
+    }
+    td_->message_query_manager_->finish_get_message_views(dialog_id_, message_ids_);
+  }
+};
+
+class GetMessagesReactionsQuery final : public Td::ResultHandler {
+  DialogId dialog_id_;
+  vector<MessageId> message_ids_;
+
+ public:
+  void send(DialogId dialog_id, vector<MessageId> &&message_ids) {
+    dialog_id_ = dialog_id;
+    message_ids_ = std::move(message_ids);
+
+    auto input_peer = td_->dialog_manager_->get_input_peer(dialog_id_, AccessRights::Read);
+    CHECK(input_peer != nullptr);
+
+    send_query(
+        G()->net_query_creator().create(telegram_api::messages_getMessagesReactions(
+                                            std::move(input_peer), MessageId::get_server_message_ids(message_ids_)),
+                                        {{dialog_id_}}));
+  }
+
+  void on_result(BufferSlice packet) final {
+    auto result_ptr = fetch_result<telegram_api::messages_getMessagesReactions>(packet);
+    if (result_ptr.is_error()) {
+      return on_error(result_ptr.move_as_error());
+    }
+
+    auto ptr = result_ptr.move_as_ok();
+    LOG(INFO) << "Receive result for GetMessagesReactionsQuery: " << to_string(ptr);
+    if (ptr->get_id() == telegram_api::updates::ID) {
+      auto &updates = static_cast<telegram_api::updates *>(ptr.get())->updates_;
+      FlatHashSet<MessageId, MessageIdHash> skipped_message_ids;
+      for (auto message_id : message_ids_) {
+        skipped_message_ids.insert(message_id);
+      }
+      for (const auto &update : updates) {
+        if (update->get_id() == telegram_api::updateMessageReactions::ID) {
+          auto update_message_reactions = static_cast<const telegram_api::updateMessageReactions *>(update.get());
+          if (DialogId(update_message_reactions->peer_) == dialog_id_) {
+            skipped_message_ids.erase(MessageId(ServerMessageId(update_message_reactions->msg_id_)));
+          }
+        }
+      }
+      for (auto message_id : skipped_message_ids) {
+        td_->messages_manager_->update_message_reactions({dialog_id_, message_id}, nullptr);
+      }
+    }
+    td_->updates_manager_->on_get_updates(std::move(ptr), Promise<Unit>());
+    td_->message_query_manager_->try_reload_message_reactions(dialog_id_, true);
+  }
+
+  void on_error(Status status) final {
+    td_->dialog_manager_->on_get_dialog_error(dialog_id_, status, "GetMessagesReactionsQuery");
+    td_->message_query_manager_->try_reload_message_reactions(dialog_id_, true);
+  }
+};
+
+class AppendToDoListQuery final : public Td::ResultHandler {
+  Promise<Unit> promise_;
+  DialogId dialog_id_;
+  MessageId message_id_;
+
+ public:
+  explicit AppendToDoListQuery(Promise<Unit> &&promise) : promise_(std::move(promise)) {
+  }
+
+  void send(DialogId dialog_id, MessageId message_id, const vector<ToDoItem> &items) {
+    dialog_id_ = dialog_id;
+    message_id_ = message_id;
+    auto input_peer = td_->dialog_manager_->get_input_peer(dialog_id, AccessRights::Read);
+    CHECK(input_peer != nullptr);
+    send_query(G()->net_query_creator().create(telegram_api::messages_appendTodoList(
+        std::move(input_peer), message_id.get_server_message_id().get(),
+        transform(items, [user_manager = td_->user_manager_.get()](const auto &item) {
+          return item.get_input_todo_item(user_manager);
+        }))));
+  }
+
+  void on_result(BufferSlice packet) final {
+    auto result_ptr = fetch_result<telegram_api::messages_appendTodoList>(packet);
+    if (result_ptr.is_error()) {
+      return on_error(result_ptr.move_as_error());
+    }
+
+    auto ptr = result_ptr.move_as_ok();
+    LOG(INFO) << "Receive result for AppendToDoListQuery: " << to_string(ptr);
+    td_->updates_manager_->on_get_updates(std::move(ptr), std::move(promise_));
+  }
+
+  void on_error(Status status) final {
+    td_->messages_manager_->on_get_message_error(dialog_id_, message_id_, status, "AppendToDoListQuery");
+    promise_.set_error(std::move(status));
+  }
+};
+
+class ToggleToDoCompletedQuery final : public Td::ResultHandler {
+  Promise<Unit> promise_;
+  DialogId dialog_id_;
+  MessageId message_id_;
+
+ public:
+  explicit ToggleToDoCompletedQuery(Promise<Unit> &&promise) : promise_(std::move(promise)) {
+  }
+
+  void send(DialogId dialog_id, MessageId message_id, vector<int32> &&done_task_ids,
+            vector<int32> &&not_done_task_ids) {
+    dialog_id_ = dialog_id;
+    message_id_ = message_id;
+    auto input_peer = td_->dialog_manager_->get_input_peer(dialog_id, AccessRights::Read);
+    CHECK(input_peer != nullptr);
+    send_query(G()->net_query_creator().create(
+        telegram_api::messages_toggleTodoCompleted(std::move(input_peer), message_id.get_server_message_id().get(),
+                                                   std::move(done_task_ids), std::move(not_done_task_ids))));
+  }
+
+  void on_result(BufferSlice packet) final {
+    auto result_ptr = fetch_result<telegram_api::messages_toggleTodoCompleted>(packet);
+    if (result_ptr.is_error()) {
+      return on_error(result_ptr.move_as_error());
+    }
+
+    auto ptr = result_ptr.move_as_ok();
+    LOG(INFO) << "Receive result for ToggleToDoCompletedQuery: " << to_string(ptr);
+    td_->updates_manager_->on_get_updates(std::move(ptr), std::move(promise_));
+  }
+
+  void on_error(Status status) final {
+    td_->messages_manager_->on_get_message_error(dialog_id_, message_id_, status, "ToggleToDoCompletedQuery");
     promise_.set_error(std::move(status));
   }
 };
@@ -554,18 +1023,8 @@ class BlockFromRepliesQuery final : public Td::ResultHandler {
   }
 
   void send(MessageId message_id, bool need_delete_message, bool need_delete_all_messages, bool report_spam) {
-    int32 flags = 0;
-    if (need_delete_message) {
-      flags |= telegram_api::contacts_blockFromReplies::DELETE_MESSAGE_MASK;
-    }
-    if (need_delete_all_messages) {
-      flags |= telegram_api::contacts_blockFromReplies::DELETE_HISTORY_MASK;
-    }
-    if (report_spam) {
-      flags |= telegram_api::contacts_blockFromReplies::REPORT_SPAM_MASK;
-    }
     send_query(G()->net_query_creator().create(telegram_api::contacts_blockFromReplies(
-        flags, false /*ignored*/, false /*ignored*/, false /*ignored*/, message_id.get_server_message_id().get())));
+        0, need_delete_message, need_delete_all_messages, report_spam, message_id.get_server_message_id().get())));
   }
 
   void on_result(BufferSlice packet) final {
@@ -592,12 +1051,7 @@ class DeletePhoneCallHistoryQuery final : public Td::ResultHandler {
   }
 
   void send(bool revoke) {
-    int32 flags = 0;
-    if (revoke) {
-      flags |= telegram_api::messages_deletePhoneCallHistory::REVOKE_MASK;
-    }
-    send_query(
-        G()->net_query_creator().create(telegram_api::messages_deletePhoneCallHistory(flags, false /*ignored*/)));
+    send_query(G()->net_query_creator().create(telegram_api::messages_deletePhoneCallHistory(0, revoke)));
   }
 
   void on_result(BufferSlice packet) final {
@@ -634,11 +1088,11 @@ class DeleteParticipantHistoryQuery final : public Td::ResultHandler {
 
     auto input_channel = td_->chat_manager_->get_input_channel(channel_id);
     if (input_channel == nullptr) {
-      return promise_.set_error(Status::Error(400, "Chat is not accessible"));
+      return promise_.set_error(400, "Chat is not accessible");
     }
     auto input_peer = td_->dialog_manager_->get_input_peer(sender_dialog_id, AccessRights::Know);
     if (input_peer == nullptr) {
-      return promise_.set_error(Status::Error(400, "Message sender is not accessible"));
+      return promise_.set_error(400, "Message sender is not accessible");
     }
 
     send_query(G()->net_query_creator().create(
@@ -675,19 +1129,11 @@ class DeleteHistoryQuery final : public Td::ResultHandler {
 
     auto input_peer = td_->dialog_manager_->get_input_peer(dialog_id_, AccessRights::Read);
     if (input_peer == nullptr) {
-      return promise_.set_error(Status::Error(400, "Chat is not accessible"));
-    }
-
-    int32 flags = 0;
-    if (!remove_from_dialog_list) {
-      flags |= telegram_api::messages_deleteHistory::JUST_CLEAR_MASK;
-    }
-    if (revoke) {
-      flags |= telegram_api::messages_deleteHistory::REVOKE_MASK;
+      return promise_.set_error(400, "Chat is not accessible");
     }
 
     send_query(G()->net_query_creator().create(
-        telegram_api::messages_deleteHistory(flags, false /*ignored*/, false /*ignored*/, std::move(input_peer),
+        telegram_api::messages_deleteHistory(0, !remove_from_dialog_list, revoke, std::move(input_peer),
                                              max_message_id.get_server_message_id().get(), 0, 0)));
   }
 
@@ -725,13 +1171,8 @@ class DeleteChannelHistoryQuery final : public Td::ResultHandler {
       return on_error(Status::Error(400, "Can't access the chat"));
     }
 
-    int32 flags = 0;
-    if (revoke) {
-      flags |= telegram_api::channels_deleteHistory::FOR_EVERYONE_MASK;
-    }
-
     send_query(G()->net_query_creator().create(telegram_api::channels_deleteHistory(
-        flags, false /*ignored*/, std::move(input_channel), max_message_id.get_server_message_id().get())));
+        0, revoke, std::move(input_channel), max_message_id.get_server_message_id().get())));
   }
 
   void on_result(BufferSlice packet) final {
@@ -766,18 +1207,14 @@ class DeleteMessagesByDateQuery final : public Td::ResultHandler {
 
     auto input_peer = td_->dialog_manager_->get_input_peer(dialog_id_, AccessRights::Read);
     if (input_peer == nullptr) {
-      return promise_.set_error(Status::Error(400, "Chat is not accessible"));
+      return promise_.set_error(400, "Chat is not accessible");
     }
 
-    int32 flags = telegram_api::messages_deleteHistory::JUST_CLEAR_MASK |
-                  telegram_api::messages_deleteHistory::MIN_DATE_MASK |
-                  telegram_api::messages_deleteHistory::MAX_DATE_MASK;
-    if (revoke) {
-      flags |= telegram_api::messages_deleteHistory::REVOKE_MASK;
-    }
-
-    send_query(G()->net_query_creator().create(telegram_api::messages_deleteHistory(
-        flags, false /*ignored*/, false /*ignored*/, std::move(input_peer), 0, min_date, max_date)));
+    int32 flags =
+        telegram_api::messages_deleteHistory::MIN_DATE_MASK | telegram_api::messages_deleteHistory::MAX_DATE_MASK;
+    bool just_clear = true;
+    send_query(G()->net_query_creator().create(
+        telegram_api::messages_deleteHistory(flags, just_clear, revoke, std::move(input_peer), 0, min_date, max_date)));
   }
 
   void on_result(BufferSlice packet) final {
@@ -808,13 +1245,8 @@ class DeleteMessagesQuery final : public Td::ResultHandler {
     dialog_id_ = dialog_id;
     server_message_ids_ = server_message_ids;
 
-    int32 flags = 0;
-    if (revoke) {
-      flags |= telegram_api::messages_deleteMessages::REVOKE_MASK;
-    }
-
     send_query(G()->net_query_creator().create(
-        telegram_api::messages_deleteMessages(flags, false /*ignored*/, std::move(server_message_ids))));
+        telegram_api::messages_deleteMessages(0, revoke, std::move(server_message_ids))));
   }
 
   void on_result(BufferSlice packet) final {
@@ -982,7 +1414,7 @@ class ReadMentionsQuery final : public Td::ResultHandler {
 
     auto input_peer = td_->dialog_manager_->get_input_peer(dialog_id_, AccessRights::Read);
     if (input_peer == nullptr) {
-      return promise_.set_error(Status::Error(400, "Chat is not accessible"));
+      return promise_.set_error(400, "Chat is not accessible");
     }
 
     int32 flags = 0;
@@ -1013,26 +1445,34 @@ class ReadMentionsQuery final : public Td::ResultHandler {
 class ReadReactionsQuery final : public Td::ResultHandler {
   Promise<AffectedHistory> promise_;
   DialogId dialog_id_;
+  MessageId top_thread_message_id_;
 
  public:
   explicit ReadReactionsQuery(Promise<AffectedHistory> &&promise) : promise_(std::move(promise)) {
   }
 
-  void send(DialogId dialog_id, MessageId top_thread_message_id) {
+  void send(DialogId dialog_id, MessageId top_thread_message_id, SavedMessagesTopicId saved_messages_topic_id) {
     dialog_id_ = dialog_id;
 
     auto input_peer = td_->dialog_manager_->get_input_peer(dialog_id_, AccessRights::Read);
     if (input_peer == nullptr) {
-      return promise_.set_error(Status::Error(400, "Chat is not accessible"));
+      return promise_.set_error(400, "Chat is not accessible");
     }
 
     int32 flags = 0;
     if (top_thread_message_id.is_valid()) {
       flags |= telegram_api::messages_readReactions::TOP_MSG_ID_MASK;
     }
+    telegram_api::object_ptr<telegram_api::InputPeer> saved_input_peer;
+    if (saved_messages_topic_id.is_valid()) {
+      flags |= telegram_api::messages_readReactions::SAVED_PEER_ID_MASK;
+      saved_input_peer = saved_messages_topic_id.get_input_peer(td_);
+      CHECK(saved_input_peer != nullptr);
+    }
     send_query(G()->net_query_creator().create(
         telegram_api::messages_readReactions(flags, std::move(input_peer),
-                                             top_thread_message_id.get_server_message_id().get()),
+                                             top_thread_message_id.get_server_message_id().get(),
+                                             std::move(saved_input_peer)),
         {{dialog_id}}));
   }
 
@@ -1046,7 +1486,7 @@ class ReadReactionsQuery final : public Td::ResultHandler {
   }
 
   void on_error(Status status) final {
-    td_->dialog_manager_->on_get_dialog_error(dialog_id_, status, "ReadReactionsQuery");
+    td_->messages_manager_->on_get_message_error(dialog_id_, top_thread_message_id_, status, "ReadReactionsQuery");
     promise_.set_error(std::move(status));
   }
 };
@@ -1141,7 +1581,7 @@ class UnpinAllMessagesQuery final : public Td::ResultHandler {
   explicit UnpinAllMessagesQuery(Promise<AffectedHistory> &&promise) : promise_(std::move(promise)) {
   }
 
-  void send(DialogId dialog_id, MessageId top_thread_message_id) {
+  void send(DialogId dialog_id, MessageId top_thread_message_id, SavedMessagesTopicId saved_messages_topic_id) {
     dialog_id_ = dialog_id;
     top_thread_message_id_ = top_thread_message_id;
 
@@ -1155,8 +1595,15 @@ class UnpinAllMessagesQuery final : public Td::ResultHandler {
     if (top_thread_message_id.is_valid()) {
       flags |= telegram_api::messages_unpinAllMessages::TOP_MSG_ID_MASK;
     }
+    telegram_api::object_ptr<telegram_api::InputPeer> saved_input_peer;
+    if (saved_messages_topic_id.is_valid()) {
+      flags |= telegram_api::messages_unpinAllMessages::SAVED_PEER_ID_MASK;
+      saved_input_peer = saved_messages_topic_id.get_input_peer(td_);
+      CHECK(saved_input_peer != nullptr);
+    }
     send_query(G()->net_query_creator().create(telegram_api::messages_unpinAllMessages(
-        flags, std::move(input_peer), top_thread_message_id.get_server_message_id().get())));
+        flags, std::move(input_peer), top_thread_message_id.get_server_message_id().get(),
+        std::move(saved_input_peer))));
   }
 
   void on_result(BufferSlice packet) final {
@@ -1266,7 +1713,7 @@ void MessageQueryManager::upload_message_cover(BusinessConnectionId business_con
   cover.promise_ = std::move(promise);
 
   auto input_media = photo_get_cover_input_media(td_->file_manager_.get(), cover.photo_,
-                                                 td_->auth_manager_->is_bot() && bad_parts.empty());
+                                                 td_->auth_manager_->is_bot() && bad_parts.empty(), true);
   if (input_media != nullptr && bad_parts.empty()) {
     return do_upload_cover(file_upload_id, std::move(cover));
   }
@@ -1323,27 +1770,26 @@ void MessageQueryManager::do_upload_cover(FileUploadId file_upload_id, BeingUplo
 void MessageQueryManager::complete_upload_message_cover(
     BusinessConnectionId business_connection_id, DialogId dialog_id, Photo photo, FileUploadId file_upload_id,
     telegram_api::object_ptr<telegram_api::MessageMedia> &&media_ptr, Promise<Unit> &&promise) {
+  send_closure_later(G()->file_manager(), &FileManager::cancel_upload, file_upload_id);
+
   if (media_ptr->get_id() != telegram_api::messageMediaPhoto::ID) {
-    return promise.set_error(Status::Error(500, "Receive invalid response"));
+    return promise.set_error(500, "Receive invalid response");
   }
   auto media = telegram_api::move_object_as<telegram_api::messageMediaPhoto>(media_ptr);
-  if (media->photo_ == nullptr || (media->flags_ & telegram_api::messageMediaPhoto::TTL_SECONDS_MASK) != 0) {
-    return promise.set_error(Status::Error(500, "Receive invalid response without photo"));
+  if (media->photo_ == nullptr || media->ttl_seconds_ != 0) {
+    return promise.set_error(500, "Receive invalid response without photo");
   }
   auto new_photo = get_photo(td_, std::move(media->photo_), dialog_id, FileType::Photo);
   if (new_photo.is_empty()) {
-    return promise.set_error(Status::Error(500, "Receive invalid photo in response"));
+    return promise.set_error(500, "Receive invalid photo in response");
   }
   bool is_content_changed = false;
   bool need_update = false;
   merge_photos(td_, &photo, &new_photo, dialog_id, true, is_content_changed, need_update);
 
-  auto old_file_id = file_upload_id.get_file_id();
-  send_closure_later(G()->file_manager(), &FileManager::cancel_upload, file_upload_id);
-
-  auto input_media = photo_get_cover_input_media(td_->file_manager_.get(), photo, true);
+  auto input_media = photo_get_cover_input_media(td_->file_manager_.get(), photo, true, true);
   if (input_media == nullptr) {
-    return promise.set_error(Status::Error(500, "Failed to upload file"));
+    return promise.set_error(500, "Failed to upload file");
   }
   promise.set_value(Unit());
 }
@@ -1355,10 +1801,68 @@ void MessageQueryManager::report_message_delivery(MessageFullId message_full_id,
   td_->create_handler<ReportMessageDeliveryQuery>()->send(message_full_id, from_push);
 }
 
-void MessageQueryManager::get_message_fact_checks(
-    DialogId dialog_id, const vector<MessageId> &message_ids,
-    Promise<vector<telegram_api::object_ptr<telegram_api::factCheck>>> &&promise) {
+void MessageQueryManager::send_bot_requested_peer(MessageFullId message_full_id, int32 button_id,
+                                                  vector<DialogId> shared_dialog_ids, Promise<Unit> &&promise) {
+  td_->create_handler<SendBotRequestedPeerQuery>(std::move(promise))
+      ->send(message_full_id, button_id, std::move(shared_dialog_ids));
+}
+
+void MessageQueryManager::reload_message_extended_media(DialogId dialog_id, vector<MessageId> message_ids) {
+  CHECK(dialog_id.get_type() != DialogType::SecretChat);
+  td::remove_if(message_ids, [&](MessageId message_id) {
+    return !being_reloaded_fact_checks_.insert({dialog_id, message_id}).second;
+  });
+  if (message_ids.empty()) {
+    return;
+  }
+  td_->create_handler<GetExtendedMediaQuery>()->send(dialog_id, std::move(message_ids));
+}
+
+void MessageQueryManager::finish_get_message_extended_media(DialogId dialog_id, const vector<MessageId> &message_ids) {
+  for (auto message_id : message_ids) {
+    being_reloaded_extended_media_message_full_ids_.erase({dialog_id, message_id});
+  }
+}
+
+void MessageQueryManager::reload_message_fact_checks(DialogId dialog_id, vector<MessageId> message_ids) {
+  CHECK(dialog_id.get_type() != DialogType::SecretChat);
+  td::remove_if(message_ids, [&](MessageId message_id) {
+    return !being_reloaded_fact_checks_.insert({dialog_id, message_id}).second;
+  });
+  if (message_ids.empty()) {
+    return;
+  }
+
+  auto promise =
+      PromiseCreator::lambda([actor_id = actor_id(this), dialog_id, message_ids](
+                                 Result<vector<telegram_api::object_ptr<telegram_api::factCheck>>> r_fact_checks) {
+        send_closure(actor_id, &MessageQueryManager::on_reload_message_fact_checks, dialog_id, message_ids,
+                     std::move(r_fact_checks));
+      });
   td_->create_handler<GetFactCheckQuery>(std::move(promise))->send(dialog_id, message_ids);
+}
+
+void MessageQueryManager::on_reload_message_fact_checks(
+    DialogId dialog_id, const vector<MessageId> &message_ids,
+    Result<vector<telegram_api::object_ptr<telegram_api::factCheck>>> r_fact_checks) {
+  G()->ignore_result_if_closing(r_fact_checks);
+  for (auto message_id : message_ids) {
+    auto erased_count = being_reloaded_fact_checks_.erase({dialog_id, message_id});
+    CHECK(erased_count > 0);
+  }
+  if (r_fact_checks.is_error() || !td_->dialog_manager_->have_input_peer(dialog_id, false, AccessRights::Read)) {
+    return;
+  }
+  auto fact_checks = r_fact_checks.move_as_ok();
+  if (fact_checks.size() != message_ids.size()) {
+    LOG(ERROR) << "Receive " << fact_checks.size() << " fact checks instead of " << message_ids.size();
+    return;
+  }
+  for (size_t i = 0; i < message_ids.size(); i++) {
+    td_->messages_manager_->on_update_message_fact_check(
+        {dialog_id, message_ids[i]},
+        FactCheck::get_fact_check(td_->user_manager_.get(), std::move(fact_checks[i]), false));
+  }
 }
 
 void MessageQueryManager::set_message_fact_check(MessageFullId message_full_id, const FormattedText &fact_check_text,
@@ -1367,16 +1871,23 @@ void MessageQueryManager::set_message_fact_check(MessageFullId message_full_id, 
       ->send(message_full_id.get_dialog_id(), message_full_id.get_message_id(), fact_check_text);
 }
 
+void MessageQueryManager::toggle_suggested_post_approval(MessageFullId message_full_id, bool is_rejected,
+                                                         int32 schedule_date, const string &comment,
+                                                         Promise<Unit> &&promise) {
+  td_->create_handler<ToggleSuggestedPostApprovalQuery>(std::move(promise))
+      ->send(message_full_id.get_dialog_id(), message_full_id.get_message_id(), is_rejected, schedule_date, comment);
+}
+
 void MessageQueryManager::search_messages(DialogListId dialog_list_id, bool ignore_folder_id, const string &query,
                                           const string &offset_str, int32 limit, MessageSearchFilter filter,
                                           td_api::object_ptr<td_api::SearchMessagesChatTypeFilter> &&dialog_type_filter,
                                           int32 min_date, int32 max_date,
                                           Promise<td_api::object_ptr<td_api::foundMessages>> &&promise) {
   if (!dialog_list_id.is_folder()) {
-    return promise.set_error(Status::Error(400, "Wrong chat list specified"));
+    return promise.set_error(400, "Wrong chat list specified");
   }
   if (limit <= 0) {
-    return promise.set_error(Status::Error(400, "Parameter limit must be positive"));
+    return promise.set_error(400, "Parameter limit must be positive");
   }
   if (limit > MAX_SEARCH_MESSAGES) {
     limit = MAX_SEARCH_MESSAGES;
@@ -1388,7 +1899,7 @@ void MessageQueryManager::search_messages(DialogListId dialog_list_id, bool igno
   if (filter == MessageSearchFilter::Mention || filter == MessageSearchFilter::UnreadMention ||
       filter == MessageSearchFilter::UnreadReaction || filter == MessageSearchFilter::FailedToSend ||
       filter == MessageSearchFilter::Pinned) {
-    return promise.set_error(Status::Error(400, "The filter is not supported"));
+    return promise.set_error(400, "The filter is not supported");
   }
 
   if (query.empty() && filter == MessageSearchFilter::Empty) {
@@ -1416,8 +1927,8 @@ void MessageQueryManager::on_get_messages_search_result(
     next_offset.update_from_message(message);
 
     bool is_channel_message = DialogId::get_message_dialog_id(message).get_type() == DialogType::Channel;
-    auto new_message_full_id =
-        td_->messages_manager_->on_get_message(std::move(message), false, is_channel_message, false, "search messages");
+    auto new_message_full_id = td_->messages_manager_->on_get_message(DialogId(), std::move(message), false,
+                                                                      is_channel_message, false, "search messages");
     if (new_message_full_id != MessageFullId()) {
       result.push_back(new_message_full_id);
     } else {
@@ -1442,7 +1953,7 @@ void MessageQueryManager::on_get_messages_search_result(
 void MessageQueryManager::search_outgoing_document_messages(
     const string &query, int32 limit, Promise<td_api::object_ptr<td_api::foundMessages>> &&promise) {
   if (limit <= 0) {
-    return promise.set_error(Status::Error(400, "Parameter limit must be positive"));
+    return promise.set_error(400, "Parameter limit must be positive");
   }
   if (limit > MAX_SEARCH_MESSAGES) {
     limit = MAX_SEARCH_MESSAGES;
@@ -1459,11 +1970,9 @@ void MessageQueryManager::on_get_outgoing_document_messages(
   MessagesManager::FoundMessages found_messages;
   for (auto &message : messages) {
     auto dialog_id = DialogId::get_message_dialog_id(message);
-    auto message_full_id =
-        td_->messages_manager_->on_get_message(std::move(message), false, dialog_id.get_type() == DialogType::Channel,
-                                               false, "on_get_outgoing_document_messages");
+    auto message_full_id = td_->messages_manager_->on_get_message(dialog_id, std::move(message), false, false, false,
+                                                                  "on_get_outgoing_document_messages");
     if (message_full_id != MessageFullId()) {
-      CHECK(dialog_id == message_full_id.get_dialog_id());
       found_messages.message_full_ids.push_back(message_full_id);
     }
   }
@@ -1477,7 +1986,7 @@ void MessageQueryManager::on_get_outgoing_document_messages(
 void MessageQueryManager::search_hashtag_posts(string hashtag, string offset_str, int32 limit,
                                                Promise<td_api::object_ptr<td_api::foundMessages>> &&promise) {
   if (limit <= 0) {
-    return promise.set_error(Status::Error(400, "Parameter limit must be positive"));
+    return promise.set_error(400, "Parameter limit must be positive");
   }
   if (limit > MAX_SEARCH_MESSAGES) {
     limit = MAX_SEARCH_MESSAGES;
@@ -1513,7 +2022,7 @@ void MessageQueryManager::on_get_hashtag_search_result(
     next_offset.update_from_message(message);
 
     auto new_message_full_id =
-        td_->messages_manager_->on_get_message(std::move(message), false, true, false, "search hashtag");
+        td_->messages_manager_->on_get_message(DialogId(), std::move(message), false, true, false, "search hashtag");
     if (new_message_full_id != MessageFullId()) {
       result.push_back(new_message_full_id);
     } else {
@@ -1540,7 +2049,7 @@ void MessageQueryManager::search_dialog_recent_location_messages(
   LOG(INFO) << "Search recent location messages in " << dialog_id << " with limit " << limit;
 
   if (limit <= 0) {
-    return promise.set_error(Status::Error(400, "Parameter limit must be positive"));
+    return promise.set_error(400, "Parameter limit must be positive");
   }
   if (limit > MAX_SEARCH_MESSAGES) {
     limit = MAX_SEARCH_MESSAGES;
@@ -1559,7 +2068,7 @@ void MessageQueryManager::search_dialog_recent_location_messages(
                                                                            "search_dialog_recent_location_messages"));
     default:
       UNREACHABLE();
-      promise.set_error(Status::Error(500, "Message search is not supported"));
+      promise.set_error(500, "Message search is not supported");
   }
 }
 
@@ -1571,15 +2080,9 @@ void MessageQueryManager::on_get_recent_locations(DialogId dialog_id, int32 limi
   LOG(INFO) << "Receive " << messages.size() << " recent locations in " << dialog_id;
   vector<MessageId> message_ids;
   for (auto &message : messages) {
-    auto new_message_full_id = td_->messages_manager_->on_get_message(
-        std::move(message), false, dialog_id.get_type() == DialogType::Channel, false, "get recent locations");
+    auto new_message_full_id = td_->messages_manager_->on_get_message(dialog_id, std::move(message), false, false,
+                                                                      false, "on_get_recent_locations");
     if (new_message_full_id != MessageFullId()) {
-      if (new_message_full_id.get_dialog_id() != dialog_id) {
-        LOG(ERROR) << "Receive " << new_message_full_id << " instead of a message in " << dialog_id;
-        total_count--;
-        continue;
-      }
-
       message_ids.push_back(new_message_full_id.get_message_id());
     } else {
       total_count--;
@@ -1602,6 +2105,23 @@ void MessageQueryManager::on_get_recent_locations(DialogId dialog_id, int32 limi
   });
 
   promise.set_value(std::move(result));
+}
+
+void MessageQueryManager::get_dialog_message_position_from_server(DialogId dialog_id, MessageTopic message_topic,
+                                                                  MessageSearchFilter filter, MessageId message_id,
+                                                                  Promise<int32> &&promise) {
+  if (filter == MessageSearchFilter::UnreadMention || filter == MessageSearchFilter::UnreadReaction ||
+      filter == MessageSearchFilter::FailedToSend) {
+    return promise.set_error(400, "The filter is not supported");
+  }
+
+  td_->create_handler<GetMessagePositionQuery>(std::move(promise))->send(dialog_id, message_id, filter, message_topic);
+}
+
+void MessageQueryManager::get_message_read_date_from_server(
+    MessageFullId message_full_id, Promise<td_api::object_ptr<td_api::MessageReadDate>> &&promise) {
+  td_->create_handler<GetOutboxReadDateQuery>(std::move(promise))
+      ->send(message_full_id.get_dialog_id(), message_full_id.get_message_id());
 }
 
 void MessageQueryManager::get_message_viewers(MessageFullId message_full_id,
@@ -1657,6 +2177,199 @@ void MessageQueryManager::on_get_message_viewers(DialogId dialog_id, MessageView
   promise.set_value(message_viewers.get_message_viewers_object(td_->user_manager_.get()));
 }
 
+void MessageQueryManager::view_messages(DialogId dialog_id, const vector<MessageId> &message_ids,
+                                        bool increment_view_counter) {
+  const size_t MAX_MESSAGE_VIEWS = 100;  // server-side limit
+  vector<MessageId> viewed_message_ids;
+  viewed_message_ids.reserve(min(message_ids.size(), MAX_MESSAGE_VIEWS));
+  for (auto message_id : message_ids) {
+    MessageFullId message_full_id{dialog_id, message_id};
+    if (!being_reloaded_views_message_full_ids_.insert(message_full_id).second) {
+      if (!increment_view_counter || !need_view_counter_increment_message_full_ids_.insert(message_full_id).second) {
+        continue;
+      }
+    } else if (increment_view_counter) {
+      need_view_counter_increment_message_full_ids_.insert(message_full_id);
+    }
+    viewed_message_ids.push_back(message_id);
+    if (viewed_message_ids.size() >= MAX_MESSAGE_VIEWS) {
+      td_->create_handler<GetMessagesViewsQuery>()->send(dialog_id, std::move(viewed_message_ids),
+                                                         increment_view_counter);
+      viewed_message_ids.clear();
+    }
+  }
+  if (!viewed_message_ids.empty()) {
+    td_->create_handler<GetMessagesViewsQuery>()->send(dialog_id, std::move(viewed_message_ids),
+                                                       increment_view_counter);
+  }
+}
+
+void MessageQueryManager::finish_get_message_views(DialogId dialog_id, const vector<MessageId> &message_ids) {
+  for (auto message_id : message_ids) {
+    MessageFullId message_full_id{dialog_id, message_id};
+    being_reloaded_views_message_full_ids_.erase(message_full_id);
+    need_view_counter_increment_message_full_ids_.erase(message_full_id);
+  }
+}
+
+void MessageQueryManager::queue_message_reactions_reload(MessageFullId message_full_id) {
+  auto dialog_id = message_full_id.get_dialog_id();
+  CHECK(dialog_id.is_valid());
+  auto message_id = message_full_id.get_message_id();
+  CHECK(message_id.is_valid());
+  being_reloaded_reactions_[dialog_id].message_ids.insert(message_id);
+  try_reload_message_reactions(dialog_id, false);
+}
+
+void MessageQueryManager::queue_message_reactions_reload(DialogId dialog_id, const vector<MessageId> &message_ids) {
+  LOG(INFO) << "Queue reload of reactions in " << message_ids << " in " << dialog_id;
+  auto &message_ids_to_reload = being_reloaded_reactions_[dialog_id].message_ids;
+  for (auto &message_id : message_ids) {
+    CHECK(message_id.is_valid());
+    message_ids_to_reload.insert(message_id);
+  }
+  try_reload_message_reactions(dialog_id, false);
+}
+
+void MessageQueryManager::try_reload_message_reactions(DialogId dialog_id, bool is_finished) {
+  if (G()->close_flag()) {
+    return;
+  }
+
+  auto it = being_reloaded_reactions_.find(dialog_id);
+  if (it == being_reloaded_reactions_.end()) {
+    return;
+  }
+  if (is_finished) {
+    CHECK(it->second.is_request_sent);
+    it->second.is_request_sent = false;
+
+    if (it->second.message_ids.empty()) {
+      being_reloaded_reactions_.erase(it);
+      return;
+    }
+  } else if (it->second.is_request_sent) {
+    return;
+  }
+
+  CHECK(!it->second.message_ids.empty());
+  CHECK(!it->second.is_request_sent);
+
+  it->second.is_request_sent = true;
+
+  static constexpr size_t MAX_MESSAGE_IDS = 100;  // server-side limit
+  vector<MessageId> message_ids;
+  for (auto message_id_it = it->second.message_ids.begin();
+       message_id_it != it->second.message_ids.end() && message_ids.size() < MAX_MESSAGE_IDS; ++message_id_it) {
+    auto message_id = *message_id_it;
+    if (!has_message_pending_read_reactions({dialog_id, message_id})) {
+      message_ids.push_back(message_id);
+    }
+  }
+  for (auto message_id : message_ids) {
+    it->second.message_ids.erase(message_id);
+  }
+
+  if (!td_->dialog_manager_->have_input_peer(dialog_id, false, AccessRights::Read) || message_ids.empty()) {
+    create_actor<SleepActor>("RetryReloadMessageReactionsActor", 0.2,
+                             PromiseCreator::lambda([actor_id = actor_id(this), dialog_id](Unit) mutable {
+                               send_closure(actor_id, &MessageQueryManager::try_reload_message_reactions, dialog_id,
+                                            true);
+                             }))
+        .release();
+    return;
+  }
+
+  for (const auto &message_id : message_ids) {
+    CHECK(message_id.is_server());
+  }
+
+  td_->create_handler<GetMessagesReactionsQuery>()->send(dialog_id, std::move(message_ids));
+}
+
+void MessageQueryManager::get_paid_message_reaction_senders(
+    DialogId dialog_id, Promise<td_api::object_ptr<td_api::messageSenders>> &&promise, bool is_recursive) {
+  TRY_STATUS_PROMISE(promise, G()->close_status());
+  TRY_STATUS_PROMISE(promise, td_->dialog_manager_->check_dialog_access(dialog_id, false, AccessRights::Read,
+                                                                        "get_paid_message_reaction_senders"));
+  if (!td_->dialog_manager_->is_broadcast_channel(dialog_id)) {
+    return promise.set_value(td_api::make_object<td_api::messageSenders>());
+  }
+  if (!td_->user_manager_->have_user(td_->user_manager_->get_my_id())) {
+    auto new_promise = PromiseCreator::lambda(
+        [actor_id = actor_id(this), dialog_id, promise = std::move(promise)](Result<Unit> &&result) mutable {
+          if (result.is_error()) {
+            promise.set_error(result.move_as_error());
+          } else {
+            send_closure_later(actor_id, &MessageQueryManager::get_paid_message_reaction_senders, dialog_id,
+                               std::move(promise), false);
+          }
+        });
+    td_->user_manager_->get_me(std::move(new_promise));
+    return;
+  }
+  if (td_->chat_manager_->are_created_public_broadcasts_inited()) {
+    auto senders = td_api::make_object<td_api::messageSenders>();
+    const auto &created_public_broadcasts = td_->chat_manager_->get_created_public_broadcasts();
+    auto add_sender = [&senders, td = td_](DialogId dialog_id) {
+      senders->senders_.push_back(get_message_sender_object(td, dialog_id, "add_sender"));
+      senders->total_count_++;
+    };
+    add_sender(td_->dialog_manager_->get_my_dialog_id());
+
+    std::multimap<int64, ChannelId> sorted_channel_ids;
+    for (auto channel_id : created_public_broadcasts) {
+      int64 score = td_->chat_manager_->get_channel_participant_count(channel_id);
+      sorted_channel_ids.emplace(-score, channel_id);
+    };
+    for (auto &channel_id : sorted_channel_ids) {
+      add_sender(DialogId(channel_id.second));
+    }
+    return promise.set_value(std::move(senders));
+  }
+
+  CHECK(!is_recursive);
+  auto new_promise = PromiseCreator::lambda([actor_id = actor_id(this), dialog_id, promise = std::move(promise)](
+                                                Result<td_api::object_ptr<td_api::chats>> &&result) mutable {
+    if (result.is_error()) {
+      promise.set_error(result.move_as_error());
+    } else {
+      send_closure_later(actor_id, &MessageQueryManager::get_paid_message_reaction_senders, dialog_id,
+                         std::move(promise), true);
+    }
+  });
+  td_->chat_manager_->get_created_public_dialogs(PublicDialogType::ForPersonalDialog, std::move(new_promise), true);
+}
+
+void MessageQueryManager::add_to_do_list_tasks(MessageFullId message_full_id,
+                                               vector<td_api::object_ptr<td_api::inputChecklistTask>> &&tasks,
+                                               Promise<Unit> &&promise) {
+  auto dialog_id = message_full_id.get_dialog_id();
+  if (!td_->messages_manager_->can_add_message_tasks(message_full_id, static_cast<int32>(tasks.size()))) {
+    return promise.set_error(400, "Can't add the checklist tasks to the message");
+  }
+  vector<ToDoItem> items;
+  for (auto &task : tasks) {
+    TRY_RESULT_PROMISE(promise, item, ToDoItem::get_to_do_item(td_, dialog_id, std::move(task)));
+    items.push_back(std::move(item));
+  }
+  if (items.empty()) {
+    return promise.set_error(400, "The list of new tasks must be non-empty");
+  }
+  td_->create_handler<AppendToDoListQuery>(std::move(promise))
+      ->send(dialog_id, message_full_id.get_message_id(), items);
+}
+
+void MessageQueryManager::mark_to_do_list_tasks_as_done(MessageFullId message_full_id, vector<int32> done_task_ids,
+                                                        vector<int32> not_done_task_ids, Promise<Unit> &&promise) {
+  auto dialog_id = message_full_id.get_dialog_id();
+  if (!td_->messages_manager_->can_mark_message_tasks_as_done(message_full_id)) {
+    return promise.set_error(400, "Can't mark tasks as done in the message");
+  }
+  td_->create_handler<ToggleToDoCompletedQuery>(std::move(promise))
+      ->send(dialog_id, message_full_id.get_message_id(), std::move(done_task_ids), std::move(not_done_task_ids));
+}
+
 void MessageQueryManager::get_discussion_message(DialogId dialog_id, MessageId message_id, DialogId expected_dialog_id,
                                                  MessageId expected_message_id, Promise<MessageThreadInfo> &&promise) {
   td_->create_handler<GetDiscussionMessageQuery>(std::move(promise))
@@ -1671,13 +2384,6 @@ void MessageQueryManager::process_discussion_message(
             << expected_message_id << " in " << expected_dialog_id << ": " << to_string(result);
   td_->user_manager_->on_get_users(std::move(result->users_), "process_discussion_message");
   td_->chat_manager_->on_get_chats(std::move(result->chats_), "process_discussion_message");
-
-  for (auto &message : result->messages_) {
-    auto message_dialog_id = DialogId::get_message_dialog_id(message);
-    if (message_dialog_id != expected_dialog_id) {
-      return promise.set_error(Status::Error(500, "Expected messages in a different chat"));
-    }
-  }
 
   for (auto &message : result->messages_) {
     if (td_->messages_manager_->need_channel_difference_to_add_message(expected_dialog_id, message)) {
@@ -1709,10 +2415,9 @@ void MessageQueryManager::process_discussion_message_impl(
   message_thread_info.unread_message_count = max(0, result->unread_count_);
   MessageId top_message_id;
   for (auto &message : result->messages_) {
-    auto message_full_id = td_->messages_manager_->on_get_message(std::move(message), false, true, false,
-                                                                  "process_discussion_message_impl");
+    auto message_full_id = td_->messages_manager_->on_get_message(expected_dialog_id, std::move(message), false, true,
+                                                                  false, "process_discussion_message_impl");
     if (message_full_id.get_message_id().is_valid()) {
-      CHECK(message_full_id.get_dialog_id() == expected_dialog_id);
       message_thread_info.message_ids.push_back(message_full_id.get_message_id());
       if (message_full_id.get_message_id() == expected_message_id) {
         top_message_id = expected_message_id;
@@ -2050,8 +2755,7 @@ void MessageQueryManager::delete_messages_on_server(DialogId dialog_id, vector<M
   if (message_ids.empty()) {
     return promise.set_value(Unit());
   }
-  LOG(INFO) << (revoke ? "Revoke " : "Delete ") << format::as_array(message_ids) << " in " << dialog_id
-            << " from server";
+  LOG(INFO) << (revoke ? "Revoke " : "Delete ") << message_ids << " in " << dialog_id << " from server";
 
   if (log_event_id == 0 && G()->use_message_database()) {
     log_event_id = save_delete_messages_on_server_log_event(dialog_id, message_ids, revoke);
@@ -2134,7 +2838,7 @@ void MessageQueryManager::delete_scheduled_messages_on_server(DialogId dialog_id
   if (message_ids.empty()) {
     return promise.set_value(Unit());
   }
-  LOG(INFO) << "Delete " << format::as_array(message_ids) << " in " << dialog_id << " from server";
+  LOG(INFO) << "Delete " << message_ids << " in " << dialog_id << " from server";
 
   if (log_event_id == 0 && G()->use_message_database()) {
     log_event_id = save_delete_scheduled_messages_on_server_log_event(dialog_id, message_ids);
@@ -2235,10 +2939,12 @@ void MessageQueryManager::read_all_dialog_mentions_on_server(DialogId dialog_id,
 }
 
 void MessageQueryManager::read_all_topic_reactions_on_server(DialogId dialog_id, MessageId top_thread_message_id,
+                                                             SavedMessagesTopicId saved_messages_topic_id,
                                                              uint64 log_event_id, Promise<Unit> &&promise) {
-  AffectedHistoryQuery query = [td = td_, top_thread_message_id](DialogId dialog_id,
-                                                                 Promise<AffectedHistory> &&query_promise) {
-    td->create_handler<ReadReactionsQuery>(std::move(query_promise))->send(dialog_id, top_thread_message_id);
+  AffectedHistoryQuery query = [td = td_, top_thread_message_id, saved_messages_topic_id](
+                                   DialogId dialog_id, Promise<AffectedHistory> &&query_promise) {
+    td->create_handler<ReadReactionsQuery>(std::move(query_promise))
+        ->send(dialog_id, top_thread_message_id, saved_messages_topic_id);
   };
   run_affected_history_query_until_complete(dialog_id, std::move(query), true, std::move(promise));
 }
@@ -2271,17 +2977,20 @@ void MessageQueryManager::read_all_dialog_reactions_on_server(DialogId dialog_id
   }
 
   AffectedHistoryQuery query = [td = td_](DialogId dialog_id, Promise<AffectedHistory> &&query_promise) {
-    td->create_handler<ReadReactionsQuery>(std::move(query_promise))->send(dialog_id, MessageId());
+    td->create_handler<ReadReactionsQuery>(std::move(query_promise))
+        ->send(dialog_id, MessageId(), SavedMessagesTopicId());
   };
   run_affected_history_query_until_complete(dialog_id, std::move(query), false,
                                             get_erase_log_event_promise(log_event_id, std::move(promise)));
 }
 
 void MessageQueryManager::unpin_all_topic_messages_on_server(DialogId dialog_id, MessageId top_thread_message_id,
+                                                             SavedMessagesTopicId saved_messages_topic_id,
                                                              uint64 log_event_id, Promise<Unit> &&promise) {
-  AffectedHistoryQuery query = [td = td_, top_thread_message_id](DialogId dialog_id,
-                                                                 Promise<AffectedHistory> &&query_promise) {
-    td->create_handler<UnpinAllMessagesQuery>(std::move(query_promise))->send(dialog_id, top_thread_message_id);
+  AffectedHistoryQuery query = [td = td_, top_thread_message_id, saved_messages_topic_id](
+                                   DialogId dialog_id, Promise<AffectedHistory> &&query_promise) {
+    td->create_handler<UnpinAllMessagesQuery>(std::move(query_promise))
+        ->send(dialog_id, top_thread_message_id, saved_messages_topic_id);
   };
   run_affected_history_query_until_complete(dialog_id, std::move(query), true, std::move(promise));
 }
@@ -2316,7 +3025,7 @@ void MessageQueryManager::read_message_contents_on_server(DialogId dialog_id, ve
                                                           bool skip_log_event) {
   CHECK(!message_ids.empty());
 
-  LOG(INFO) << "Read contents of " << format::as_array(message_ids) << " in " << dialog_id << " on server";
+  LOG(INFO) << "Read contents of " << message_ids << " in " << dialog_id << " on server";
 
   if (log_event_id == 0 && G()->use_message_database() && !skip_log_event) {
     log_event_id = save_read_message_contents_on_server_log_event(dialog_id, message_ids);
@@ -2341,13 +3050,49 @@ void MessageQueryManager::read_message_contents_on_server(DialogId dialog_id, ve
         send_closure(G()->secret_chats_manager(), &SecretChatsManager::send_open_message,
                      dialog_id.get_secret_chat_id(), random_id, std::move(promise));
       } else {
-        promise.set_error(Status::Error(400, "Message not found"));
+        promise.set_error(400, "Message not found");
       }
       break;
     }
     case DialogType::None:
     default:
       UNREACHABLE();
+  }
+}
+
+bool MessageQueryManager::has_message_pending_read_reactions(MessageFullId message_full_id) const {
+  return pending_read_reactions_.count(message_full_id) > 0;
+}
+
+void MessageQueryManager::read_message_reactions_on_server(DialogId dialog_id, vector<MessageId> message_ids) {
+  for (auto message_id : message_ids) {
+    pending_read_reactions_[{dialog_id, message_id}]++;
+  }
+  auto promise =
+      PromiseCreator::lambda([actor_id = actor_id(this), dialog_id, message_ids](Result<Unit> &&result) mutable {
+        send_closure(actor_id, &MessageQueryManager::on_read_message_reactions, dialog_id, std::move(message_ids),
+                     std::move(result));
+      });
+  read_message_contents_on_server(dialog_id, std::move(message_ids), 0, std::move(promise));
+}
+
+void MessageQueryManager::on_read_message_reactions(DialogId dialog_id, vector<MessageId> &&message_ids,
+                                                    Result<Unit> &&result) {
+  for (auto message_id : message_ids) {
+    MessageFullId message_full_id{dialog_id, message_id};
+    auto it = pending_read_reactions_.find(message_full_id);
+    CHECK(it != pending_read_reactions_.end());
+    if (--it->second == 0) {
+      pending_read_reactions_.erase(it);
+    }
+
+    if (!td_->messages_manager_->have_message_force(message_full_id, "on_read_message_reactions")) {
+      continue;
+    }
+
+    if (result.is_error()) {
+      queue_message_reactions_reload(message_full_id);
+    }
   }
 }
 
@@ -2379,7 +3124,8 @@ void MessageQueryManager::unpin_all_dialog_messages_on_server(DialogId dialog_id
   }
 
   AffectedHistoryQuery query = [td = td_](DialogId dialog_id, Promise<AffectedHistory> &&query_promise) {
-    td->create_handler<UnpinAllMessagesQuery>(std::move(query_promise))->send(dialog_id, MessageId());
+    td->create_handler<UnpinAllMessagesQuery>(std::move(query_promise))
+        ->send(dialog_id, MessageId(), SavedMessagesTopicId());
   };
   run_affected_history_query_until_complete(dialog_id, std::move(query), true,
                                             get_erase_log_event_promise(log_event_id, std::move(promise)));

@@ -33,6 +33,9 @@ void StarGift::store(StorerT &storer) const {
   bool has_slug = !slug_.empty();
   bool has_owner_dialog_id = owner_dialog_id_.is_valid();
   bool has_owner_address = !owner_address_.empty();
+  bool has_gift_address = !gift_address_.empty();
+  bool has_resale_star_count = resale_star_count_ != 0;
+  bool has_released_by_dialog_id = released_by_dialog_id_.is_valid();
   BEGIN_STORE_FLAGS();
   STORE_FLAG(is_limited);
   STORE_FLAG(has_default_sell_star_count);
@@ -47,6 +50,9 @@ void StarGift::store(StorerT &storer) const {
   STORE_FLAG(has_slug);
   STORE_FLAG(has_owner_dialog_id);
   STORE_FLAG(has_owner_address);
+  STORE_FLAG(has_gift_address);
+  STORE_FLAG(has_resale_star_count);
+  STORE_FLAG(has_released_by_dialog_id);
   END_STORE_FLAGS();
   td::store(id_, storer);
   if (!is_unique_) {
@@ -92,6 +98,15 @@ void StarGift::store(StorerT &storer) const {
     if (has_owner_address) {
       td::store(owner_address_, storer);
     }
+    if (has_gift_address) {
+      td::store(gift_address_, storer);
+    }
+    if (has_resale_star_count) {
+      td::store(resale_star_count_, storer);
+    }
+  }
+  if (has_released_by_dialog_id) {
+    td::store(released_by_dialog_id_, storer);
   }
 }
 
@@ -109,6 +124,9 @@ void StarGift::parse(ParserT &parser) {
   bool has_slug;
   bool has_owner_dialog_id;
   bool has_owner_address;
+  bool has_gift_address;
+  bool has_resale_star_count;
+  bool has_released_by_dialog_id;
   BEGIN_PARSE_FLAGS();
   PARSE_FLAG(is_limited);
   PARSE_FLAG(has_default_sell_star_count);
@@ -123,6 +141,9 @@ void StarGift::parse(ParserT &parser) {
   PARSE_FLAG(has_slug);
   PARSE_FLAG(has_owner_dialog_id);
   PARSE_FLAG(has_owner_address);
+  PARSE_FLAG(has_gift_address);
+  PARSE_FLAG(has_resale_star_count);
+  PARSE_FLAG(has_released_by_dialog_id);
   END_PARSE_FLAGS();
   td::parse(id_, parser);
   if (!is_unique_) {
@@ -175,6 +196,15 @@ void StarGift::parse(ParserT &parser) {
     if (has_owner_address) {
       td::parse(owner_address_, parser);
     }
+    if (has_gift_address) {
+      td::parse(gift_address_, parser);
+    }
+    if (has_resale_star_count) {
+      td::parse(resale_star_count_, parser);
+    }
+  }
+  if (has_released_by_dialog_id) {
+    td::parse(released_by_dialog_id_, parser);
   }
 }
 

@@ -45,11 +45,11 @@ for a list of all available `TDLib` [methods](https://core.telegram.org/tdlib/do
 ## Dependencies
 `TDLib` depends on:
 
-* C++14 compatible compiler (Clang 3.4+, GCC 4.9+, MSVC 19.0+ (Visual Studio 2015+), Intel C++ Compiler 17+)
+* C++17 compatible compiler (Clang 5.0+, GCC 7.0+, MSVC 19.1+ (Visual Studio 2017.7+), Intel C++ Compiler 19+)
 * OpenSSL
 * zlib
 * gperf (build only)
-* CMake (3.0.2+, build only)
+* CMake (3.10+, build only)
 * PHP (optional, for documentation generation)
 
 <a name="building"></a>
@@ -103,7 +103,7 @@ target_link_libraries(YourTarget PRIVATE Td::TdStatic)
 
 Or you could install `TDLib` and then reference it in your CMakeLists.txt like this:
 ```
-find_package(Td 1.8.44 REQUIRED)
+find_package(Td 1.8.52 REQUIRED)
 target_link_libraries(YourTarget PRIVATE Td::TdStatic)
 ```
 See [example/cpp/CMakeLists.txt](https://github.com/tdlib/td/blob/master/example/cpp/CMakeLists.txt).
@@ -116,7 +116,7 @@ See [example/java](https://github.com/tdlib/td/tree/master/example/java) for exa
 
 <a name="using-dotnet"></a>
 ## Using in .NET projects
-`TDLib` provides native .NET interface through `C++/CLI` and `C++/CX`. To enable it, specify option `-DTD_ENABLE_DOTNET=ON` to CMake.
+`TDLib` provides native .NET interface through `C++/CLI` and `C++/CX`. To enable it, specify option `-DTD_ENABLE_DOTNET=ON` or `-DTD_ENABLE_DOTNET=CX` respectively to CMake.
 .NET Core supports `C++/CLI` only since version 3.1 and only on Windows, so if older .NET Core is used or portability is needed, then `TDLib` JSON interface should be used through P/Invoke instead.
 
 See [example/csharp](https://github.com/tdlib/td/tree/master/example/csharp) for example of using `TDLib` from C# and detailed build and usage instructions.
